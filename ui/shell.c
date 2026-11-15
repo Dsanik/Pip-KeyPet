@@ -1,5 +1,7 @@
 #include "shell.h"
 #include "doodle.h"
+#include "imu.h"
+#include "mic.h"
 #include "phone.h"
 #include "pip.h"
 #include "theme.h"
@@ -459,19 +461,70 @@ static const rune_line_t rune_lines[RUNE_N] = {
     {r_xa, 2, SCR / 2 - 30 - RP, SCR / 2 + 63 - RP},    {r_xb, 2, SCR / 2 - 30 - RP, SCR / 2 + 63 - RP},  /* and below */
 };
 
-/* v runs 0..1000 up and down again; the rune breathes between a fifth and the full #9E1B1B */
-static void rune_pulse(void *var, int32_t v)
+/* How the rune answers the room. Sound (mic.h) and sharp motion (imu.h) feed a "flare", 0..1, that jumps up at once and
+   dies away in about half a second. At rest the rune only smoulders at ~20% and breathes slowly; in a flare it goes to
+   the full #9E1B1B, breathes faster and shivers by 1-2 px. */
+#define RUNE_DB_QUIET 62.0f /* below this level the room is quiet to it */
+#define RUNE_DB_LOUD 85.0f  /* a clap or a shout: a full flare */
+#define RUNE_IMU_FULL 0.7f  /* smoothed linear acceleration, g, that makes a full flare (a shake or a fall always does) */
+#define RUNE_DECAY 2.0f     /* flare lost per second */
+
+static imu_t rune_imu;
+static float rune_motion, rune_flare, rune_phase; /* rune_motion: the peak since the last step */
+static int rune_jx, rune_jy;                      /* the shiver now, px */
+static uint8_t rune_mix;
+static lv_timer_t *rune_timer;
+
+static void rune_move(int jx, int jy)
 {
-    (void)var;
-    static uint8_t last;
-    if (lv_screen_active() != sh.menu_scr) return; /* nobody sees it: no redraws */
-    float x = (v < 500 ? v : 1000 - v) / 500.0f;
-    x = x * x * (3 - 2 * x); /* eased at both ends */
-    uint8_t mix = (uint8_t)(50 + 205 * x);
-    if (mix == last) return;
-    last = mix;
+    rune_jx = jx, rune_jy = jy;
+    for (int i = 0; i < RUNE_N; i++) lv_obj_set_pos(sh.rune[i], rune_lines[i].x + jx, rune_lines[i].y + jy);
+}
+
+static void rune_paint(float b) /* b: 0..1 of #9E1B1B */
+{
+    uint8_t mix = (uint8_t)(255 * fminf(1, fmaxf(0, b)) + 0.5f);
+    if (mix == rune_mix) return;
+    rune_mix = mix;
     lv_color_t c = lv_color_mix(lv_color_hex(TH_RED), lv_color_black(), mix);
     for (int i = 0; i < RUNE_N; i++) lv_obj_set_style_line_color(sh.rune[i], c, 0);
+}
+
+static void shell_rune_motion(float ax, float ay, float az, float dt) /* from shell_imu */
+{
+    if (!TH_IS_AMULET) return;
+    int ev = imu_feed(&rune_imu, ax, ay, az, dt);
+    float k = fminf(1, rune_imu.energy / RUNE_IMU_FULL);
+    if (ev & (IMU_SHAKE | IMU_FALL)) k = 1;
+    if (k > rune_motion) rune_motion = k;
+}
+
+static void rune_step(lv_timer_t *t)
+{
+    (void)t;
+    static uint32_t last, seed = 1;
+    if (lv_screen_active() != sh.menu_scr) { last = 0; return; } /* nobody sees it: no work, no redraws */
+    uint32_t now = lv_tick_get();
+    float dt = last ? fminf(0.1f, (uint32_t)(now - last) / 1000.0f) : 0.033f;
+    last = now;
+    float in = rune_motion;
+    rune_motion = 0;
+    if (mic_on()) in = fmaxf(in, fminf(1, fmaxf(0, (mic_db() - RUNE_DB_QUIET) / (RUNE_DB_LOUD - RUNE_DB_QUIET))));
+    if (in > rune_flare) rune_flare = in; /* flares up at once, dies away slowly */
+    else rune_flare = fmaxf(0, rune_flare - RUNE_DECAY * dt);
+    float f = rune_flare;
+    rune_phase += dt * (0.3f + 3.0f * f); /* breaths a second: slow at rest, quick in a flare */
+    rune_phase -= floorf(rune_phase);
+    float s = 0.5f - 0.5f * cosf(rune_phase * 6.2831853f);
+    float b = 0.16f + (0.08f + 0.12f * f) * s; /* 16..24% at rest: about a fifth */
+    rune_paint(b + (1 - b) * f);
+    int amp = f > 0.8f ? 2 : f > 0.35f ? 1 : 0, jx = 0, jy = 0;
+    if (amp) {
+        seed = seed * 1664525u + 1013904223u;
+        jx = (int)((seed >> 20) % (2u * amp + 1)) - amp;
+        jy = (int)((seed >> 12) % (2u * amp + 1)) - amp;
+    }
+    if (jx != rune_jx || jy != rune_jy) rune_move(jx, jy);
 }
 
 static uint32_t uptime_s(void) /* ms ticks wrap every 49 days: add up the steps instead */
@@ -516,17 +569,13 @@ static void extras_apply(void)
 {
     bool rune = TH_IS_AMULET; /* in every menu style: it lies behind the rows and the icons */
     for (int i = 0; i < RUNE_N; i++) lv_obj_set_flag(sh.rune[i], LV_OBJ_FLAG_HIDDEN, !rune);
-    lv_anim_delete(&sh, rune_pulse);
+    if (rune_timer) lv_timer_delete(rune_timer), rune_timer = NULL;
     if (rune) {
-        lv_anim_t a;
-        lv_anim_init(&a);
-        lv_anim_set_var(&a, &sh);
-        lv_anim_set_exec_cb(&a, rune_pulse);
-        lv_anim_set_values(&a, 0, 1000);
-        lv_anim_set_duration(&a, 3600); /* up and down in 3.6 s */
-        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_start(&a);
-        rune_pulse(&sh, 0);
+        rune_flare = rune_motion = 0;
+        rune_mix = 0; /* force a repaint */
+        rune_move(0, 0);
+        rune_paint(0.2f);
+        rune_timer = lv_timer_create(rune_step, 33, NULL);
     }
     lv_obj_set_flag(sh.clock_lbl, LV_OBJ_FLAG_HIDDEN, !TH_IS_AMULET);
     lv_obj_set_style_text_font(sh.clock_lbl, th->small, 0);
@@ -836,6 +885,7 @@ void shell_imu(float ax, float ay, float az, float dt)
     if (!pip_display_on() && lv_screen_active() != sh.pip_scr && !awake && !phone_where()) shell_home(); /* asleep: back to his face */
     pip_shake_ok(sh.open < 0 || !apps[sh.open].imu); /* shaking a die is not shaking him */
     pip_imu(ax, ay, az, dt);
+    shell_rune_motion(ax, ay, az, dt); /* "Амулет": a sharp move makes the rune flare */
     if (sh.open >= 0 && apps[sh.open].imu) apps[sh.open].imu(ax, ay, az, dt);
 }
 

@@ -74,6 +74,14 @@ static void clock_tick(lv_timer_t *t)
 {
     (void)t;
     struct tm tm = local_now();
+    if (TH_IS_RED) { /* "Затмение": the digits, and a spark that makes the round of the rim once a minute */
+        char s[16];
+        snprintf(s, sizeof s, "%02d:%02d", tm.tm_hour, tm.tm_min);
+        th_blocks_show(ck.grid, ck.tc, s, th->accent);
+        float a = tm.tm_sec * 6 * 3.14159f / 180;
+        lv_obj_set_pos(ck.ring[0], (int)(SCR / 2 + sinf(a) * 226 - 5), (int)(SCR / 2 - cosf(a) * 226 - 5));
+        return;
+    }
     pip_info_t in;
     pip_get_info(&in);
     if (th->clock == CLOCK_DOTS) matrix_set(tm.tm_hour, tm.tm_min);
@@ -141,9 +149,30 @@ static lv_obj_t *ring_arc(lv_obj_t *scr, int size, int width, uint32_t color, in
     return a;
 }
 
+/* one ring of the corona: a circle with only a border, d px across, width px thick, in the theme's red at opa */
+static void halo(lv_obj_t *scr, int d, int width, lv_opa_t opa)
+{
+    lv_obj_t *o = lv_obj_create(scr);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, d, d);
+    lv_obj_center(o);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(o, width, 0);
+    lv_obj_set_style_border_color(o, lv_color_hex(th->accent), 0);
+    lv_obj_set_style_border_opa(o, opa, 0);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);
+}
+
 static void clock_open(lv_obj_t *scr)
 {
-    if (th->clock == CLOCK_DOTS) {
+    if (TH_IS_RED) { /* "Затмение" for "Амулет" and "Багровый": black, a thin dark-red corona on the rim, big angular digits */
+        halo(scr, SCR, 3, LV_OPA_COVER); /* the bright edge, and two fainter rings inside it: the glow */
+        halo(scr, SCR - 6, 4, LV_OPA_60);
+        halo(scr, SCR - 14, 5, LV_OPA_20);
+        ck.nd = th_blocks(ck.tc, (SCR - (24 * 14 + 12)) / 2, SCR / 2 - 48, "00:00", 14, 12); /* 5x7 cells, 12 px on a 14 px pitch */
+        ck.grid = th_cells(scr, ck.tc, ck.nd);
+        ck.ring[0] = dot(scr, SCR / 2, SCR / 2 - 226, 10, th->text); /* the spark on the corona */
+    } else if (th->clock == CLOCK_DOTS) {
         for (int i = 0; i < 60; i++) {
             float a = i * 6 * 3.14159f / 180;
             ck.ring[i] = dot(scr, (int)(SCR / 2 + sinf(a) * 212), (int)(SCR / 2 - cosf(a) * 212), i % 5 ? 6 : 10, th->faint);
@@ -1523,8 +1552,11 @@ static void style_open_term(lv_obj_t *scr)
     th_header(scr, "угрюм // стиль", 40);
     st.focus = theme_index();
     style_list();
+    /* the rows (44 px each) share the space between the header (to y 76) and the note (y 331): 50 px apart while they
+       fit, closer when there are more, and the block is centred in that space */
+    int pitch = st.n > 1 && 192 / (st.n - 1) < 50 ? 192 / (st.n - 1) : 50, top = 80 + (240 - ((st.n - 1) * pitch + 44)) / 2;
     for (int k = 0; k < st.n; k++) {
-        int i = st.ids[k], y = 122 + (TH_COUNT - st.n) * 25 + k * 50; /* fewer rows sit in the middle */
+        int i = st.ids[k], y = top + k * pitch;
         lv_obj_t *r = st.rows[k] = th_box(scr, 92, y, 282, 44, 0, th->text);
         lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(r, style_row, LV_EVENT_CLICKED, (void *)(intptr_t)i);
