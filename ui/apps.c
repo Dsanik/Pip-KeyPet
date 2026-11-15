@@ -31,8 +31,8 @@ static void recolor(lv_obj_t *o, uint32_t color) { lv_obj_set_style_bg_color(o, 
 static struct tm local_now(void)
 {
     time_t now = (time_t)shell_local_time();
-    struct tm tm;
-    gmtime_r(&now, &tm);
+    struct tm tm = {0};
+    if (!gmtime_r(&now, &tm)) memset(&tm, 0, sizeof tm); /* wday / mon index tables: never garbage */
     return tm;
 }
 
@@ -318,12 +318,15 @@ static void timer_ui(lv_timer_t *t)
     lv_obj_set_state(tm_.arc, LV_STATE_DISABLED, !fresh); /* the knob only sets a fresh timer */
 }
 
-static void timer_watch(lv_timer_t *t) /* runs always: rings even when the app is closed */
+static lv_timer_t *tm_watch;
+static void timer_watch(lv_timer_t *t) /* rings even when the app is closed; paused while no timer is counting */
 {
-    (void)t;
-    if (tm_.running && timer_left() == 0) {
+    if (!tm_.running) { lv_timer_pause(t); return; }
+    if (timer_left() == 0) {
         tm_.running = false;
         tm_.left_ms = (uint32_t)tm_.minutes * 60000;
+        lv_timer_pause(t);
+        pip_wake(); /* it rings on a dark screen too */
         shell_home();
         pip_react(PIP_SURPRISED, 4, "time's up");
     }
@@ -341,7 +344,10 @@ static void timer_start(lv_event_t *e)
 {
     (void)e;
     if (tm_.running) tm_.left_ms = timer_left(), tm_.running = false;
-    else tm_.end_tick = lv_tick_get() + tm_.left_ms, tm_.running = true;
+    else {
+        tm_.end_tick = lv_tick_get() + tm_.left_ms, tm_.running = true;
+        if (tm_watch) lv_timer_resume(tm_watch);
+    }
     timer_ui(NULL);
 }
 
@@ -491,7 +497,8 @@ static void torch_open(lv_obj_t *scr)
    so the brand mark in the middle can cover modules and the code still scans. */
 #include "src/libs/qrcode/qrcodegen.h"
 
-#define QR_COUNT (profile_links() ? profile_links() : 1) /* the links set in the panel (profile.h) */
+static int qr_count(void) { int n = profile_links(); return n < 1 ? 1 : n > 8 ? 8 : n; } /* the links set in the panel (profile.h); 8 pages at most */
+#define QR_COUNT qr_count()
 #define QR_PX 240
 #define QR_TERM 252 /* the terminal's code fills its ink plate, modules in the background colour */
 static struct {
@@ -506,7 +513,7 @@ static struct {
 
 static void qr_render(int i)
 {
-    if (qr.done >> i & 1) return;
+    if (qr.done >> i & 1 || !qr.buf[i]) return;
     qr.done |= (uint8_t)(1 << i);
     const char *text = profile_link(i)->url;
     int brand = profile_brand(text);
@@ -530,7 +537,7 @@ static void qr_render(int i)
 static void qr_warm(lv_timer_t *t) /* the others, one a tick, while nobody is swiping yet */
 {
     for (int i = 0; i < QR_COUNT && i < 8; i++)
-        if (!(qr.done >> i & 1)) { qr_render(i); return; }
+        if (!(qr.done >> i & 1) && qr.buf[i]) { qr_render(i); return; }
     lv_timer_delete(t), qr.warm = NULL;
 }
 
@@ -608,10 +615,10 @@ static void qr_open(lv_obj_t *scr)
     int size = TH_TERMINAL ? QR_TERM : QR_PX;
     if (qr.theme != theme_index() + 1) qr.done = 0, qr.theme = theme_index() + 1; /* other colours */
     if (qr.rev != profile_rev) qr.done = 0, qr.rev = profile_rev, qr.i = 0;  /* other links */
-    for (int k = 0; k < QR_COUNT && k < 8; k++) {
+    for (int k = 0; k < 8; k++) /* every page: a stale buffer of another size must never be drawn into */
         if (qr.buf[k] && qr.size != size) lv_draw_buf_destroy(qr.buf[k]), qr.buf[k] = NULL, qr.done = 0;
-        if (!qr.buf[k]) qr.buf[k] = lv_draw_buf_create(size, size, LV_COLOR_FORMAT_ARGB8888, 0);
-    }
+    for (int k = 0; k < QR_COUNT; k++)
+        if (!qr.buf[k]) qr.buf[k] = lv_draw_buf_create(size, size, LV_COLOR_FORMAT_ARGB8888, 0), qr.done &= (uint8_t)~(1 << k);
     qr.size = size;
     if (!qr.warm) qr.warm = lv_timer_create(qr_warm, 60, NULL);
     lv_obj_add_event_cb(scr, qr_gesture, LV_EVENT_GESTURE, NULL);
@@ -692,7 +699,7 @@ static void meter_set(meter_t *m, float v)
 static struct {
     meter_t m[5];
     lv_obj_t *state, *grid, *vals[5];
-    th_cell_t tc[5 * 12 + 20];
+    th_cell_t tc[5 * 12 + 32]; /* the meters, then the speaker (18 cells) and its waves (5) */
     int shown[5], want[5], nbody, nsound;
     lv_timer_t *timer, *fill;
 } care;
@@ -874,6 +881,8 @@ static void game_best(void)
 
 static void game_restart(void)
 {
+    gm.last = lv_tick_get();
+    if (gm.timer) lv_timer_resume(gm.timer); /* it sleeps on the end-of-round card */
     gm.x = gm.y = SCR / 2, gm.vx = gm.vy = 0;
     gm.points = 0, gm.left_ms = ROUND_MS, gm.ended = false;
     game_score();
@@ -885,7 +894,6 @@ static void game_restart(void)
 
 static void game_tick(lv_timer_t *t)
 {
-    (void)t;
     uint32_t el = lv_tick_elaps(gm.last);
     gm.last = lv_tick_get();
     if (gm.ended) return;
@@ -908,6 +916,10 @@ static void game_tick(lv_timer_t *t)
         lv_obj_remove_flag(gm.over, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(gm.ball, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(gm.star, LV_OBJ_FLAG_HIDDEN);
+        game_ring();
+        lv_timer_pause(t); /* nothing moves until a tap or the top button restarts it; and this tick must not go on to
+                              touch the rim and undo the end */
+        return;
     }
     gm.flash_ms -= (int32_t)el;
     game_ring();
@@ -1469,7 +1481,7 @@ static struct {
 static int nz_band(float db)
 {
     int i = 0;
-    while (db >= nz_bands[i].below) i++;
+    while (i < 4 && db >= nz_bands[i].below) i++; /* the last band catches everything, inf included */
     return i;
 }
 
@@ -1969,8 +1981,8 @@ static void e8_open(lv_obj_t *scr)
         if (!e8.tri_buf) e8.tri_buf = lv_draw_buf_create(tw, tht, LV_COLOR_FORMAT_ARGB8888, 0);
         e8.tri_red = red;
         const uint32_t tri_ink = red ? 0x1A0505 : 0x2B3BBF;
-        uint32_t *px = (uint32_t *)e8.tri_buf->data;
-        for (int y = 0; y < tht; y++)
+        uint32_t *px = e8.tri_buf ? (uint32_t *)e8.tri_buf->data : NULL;
+        for (int y = 0; e8.tri_buf && y < tht; y++)
             for (int x = 0; x < tw; x++) { /* inside all three edges, antialiased by the nearest one */
                 float d = fminf(edge(x + 0.5f, y + 0.5f, 2, 2, tw - 2, 2), fminf(edge(x + 0.5f, y + 0.5f, tw - 2, 2, tw / 2.0f, tht - 2),
                                                                              edge(x + 0.5f, y + 0.5f, tw / 2.0f, tht - 2, 2, 2)));
@@ -2235,6 +2247,7 @@ static void dc_straighten(float k) /* turn it about the view so its edges run sq
 
 static void dc_throw(float dx, float dy)
 {
+    if (dc.timer) lv_timer_resume(dc.timer); /* it sleeps while the die lies showing its face */
     float l = hypotf(dx, dy), a = l > 0.3f ? atan2f(dy, dx) : lv_rand(0, 6283) / 1000.0f, sp = 500 + lv_rand(0, 500);
     dc.vx += cosf(a) * sp, dc.vy += sinf(a) * sp;
     if (dc.phase != DC_FALL) dc.vd = 250;          /* out of the hand, down into the cup */
@@ -2321,6 +2334,7 @@ static void dc_step(lv_timer_t *t)
         moved = 1, dc.dirty = true; /* it grows */
     }
     if (moved || dc.dirty) dc_show();
+    if (dc.phase == DC_SHOW && !dc.dirty) lv_timer_pause(t); /* at rest: no more frames until the next throw */
 }
 
 static bool dc_button(int id) { if (id != PIP_BTN_PWR) return false; dc_throw(0, 0); return true; }
@@ -2371,6 +2385,7 @@ static void dc_open(lv_obj_t *scr)
     lv_image_set_inner_align(dc.img, LV_IMAGE_ALIGN_CENTER);
     dc_show();
     dc.timer = lv_timer_create(dc_step, 16, NULL);
+    lv_timer_pause(dc.timer); /* it starts at rest, showing a face */
 }
 
 /* ================= the list: the first one sits in the middle of the honeycomb ================= */
@@ -2414,4 +2429,8 @@ const app_t apps[] = {
 const int app_total = sizeof apps / sizeof apps[0];
 const int app_count = app_total - 6; /* the games above are not in the menu */
 
-void apps_init(void) { lv_timer_create(timer_watch, 250, NULL); }
+void apps_init(void)
+{
+    tm_watch = lv_timer_create(timer_watch, 250, NULL);
+    lv_timer_pause(tm_watch); /* resumed by timer_start */
+}

@@ -227,10 +227,13 @@ static void hex_clamp(void)
     sh.pan_y = fmaxf(-sh.max_y, fminf(-sh.min_y, sh.pan_y));
 }
 
-static void hex_glide(lv_timer_t *t) /* inertia after a flick */
+static void hex_glide(lv_timer_t *t) /* inertia after a flick; paused whenever there is nothing to glide */
 {
-    (void)t;
-    if (lv_screen_active() != sh.menu_scr || sh.style != MENU_HONEYCOMB || (fabsf(sh.vx) < 0.02f && fabsf(sh.vy) < 0.02f)) return;
+    if (lv_screen_active() != sh.menu_scr || sh.style != MENU_HONEYCOMB || (fabsf(sh.vx) < 0.02f && fabsf(sh.vy) < 0.02f)) {
+        sh.vx = sh.vy = 0;
+        lv_timer_pause(t); /* hex_input resumes it when a flick is let go */
+        return;
+    }
     sh.pan_x += sh.vx * 16, sh.pan_y += sh.vy * 16;
     sh.vx *= 0.9f, sh.vy *= 0.9f;
     hex_clamp();
@@ -249,7 +252,7 @@ static void hex_input(lv_event_code_t code, lv_point_t p)
         hex_clamp();
         hex_layout();
     } else if (code == LV_EVENT_RELEASED) {
-        if (abs(p.x - sh.press.x) > 12 || abs(p.y - sh.press.y) > 12) return; /* it was a drag: let it glide */
+        if (abs(p.x - sh.press.x) > 12 || abs(p.y - sh.press.y) > 12) { lv_timer_resume(sh.glide); return; } /* it was a drag: let it glide */
         sh.vx = sh.vy = 0;
         int hit = -1;
         float best = 0;
@@ -351,6 +354,7 @@ static void rows_build(void)
             mw = mw < 1 ? 1 : mw, mh = mh < 1 ? 1 : mh;
             lv_draw_buf_t *m = row_mask[i][k] = lv_draw_buf_create(mw, mh, LV_COLOR_FORMAT_A8, 0);
             LV_ASSERT_MALLOC(m);
+            lv_draw_buf_clear(m, NULL); /* shrink() leaves it untouched when a row is wider than SHRINK_MAX */
             shrink(base->data, base->header.stride, w, h, m->data, m->header.stride, mw, mh, f);
         }
     }
@@ -474,6 +478,8 @@ static float rune_motion, rune_flare, rune_phase; /* rune_motion: the peak since
 static int rune_jx, rune_jy;                      /* the shiver now, px */
 static uint8_t rune_mix;
 static lv_timer_t *rune_timer;
+static uint32_t rune_last; /* tick of the previous step, 0 = none */
+static bool rune_live;     /* the timer is running: the menu is on screen and the display is on */
 
 static void rune_move(int jx, int jy)
 {
@@ -492,7 +498,7 @@ static void rune_paint(float b) /* b: 0..1 of #9E1B1B */
 
 static void shell_rune_motion(float ax, float ay, float az, float dt) /* from shell_imu */
 {
-    if (!TH_IS_AMULET) return;
+    if (!TH_IS_AMULET || !rune_live) return; /* nobody sees the rune: no work */
     int ev = imu_feed(&rune_imu, ax, ay, az, dt);
     float k = fminf(1, rune_imu.energy / RUNE_IMU_FULL);
     if (ev & (IMU_SHAKE | IMU_FALL)) k = 1;
@@ -501,12 +507,15 @@ static void shell_rune_motion(float ax, float ay, float az, float dt) /* from sh
 
 static void rune_step(lv_timer_t *t)
 {
-    (void)t;
-    static uint32_t last, seed = 1;
-    if (lv_screen_active() != sh.menu_scr) { last = 0; return; } /* nobody sees it: no work, no redraws */
+    static uint32_t seed = 1;
+    if (lv_screen_active() != sh.menu_scr || !pip_display_on()) { /* nobody sees it: the timer sleeps until rune_wake() */
+        rune_last = 0, rune_live = false;
+        lv_timer_pause(t);
+        return;
+    }
     uint32_t now = lv_tick_get();
-    float dt = last ? fminf(0.1f, (uint32_t)(now - last) / 1000.0f) : 0.033f;
-    last = now;
+    float dt = rune_last ? fminf(0.1f, (uint32_t)(now - rune_last) / 1000.0f) : 0.033f;
+    rune_last = now;
     float in = rune_motion;
     rune_motion = 0;
     if (mic_on()) in = fmaxf(in, fminf(1, fmaxf(0, (mic_db() - RUNE_DB_QUIET) / (RUNE_DB_LOUD - RUNE_DB_QUIET))));
@@ -525,6 +534,14 @@ static void rune_step(lv_timer_t *t)
         jy = (int)((seed >> 12) % (2u * amp + 1)) - amp;
     }
     if (jx != rune_jx || jy != rune_jy) rune_move(jx, jy);
+}
+
+static void rune_wake(void) /* the menu is on screen again: the rune starts breathing */
+{
+    if (!rune_timer || rune_live) return;
+    rune_live = true, rune_last = 0, rune_flare = rune_motion = 0;
+    memset(&rune_imu, 0, sizeof rune_imu); /* its filters saw nothing while asleep */
+    lv_timer_resume(rune_timer);
 }
 
 static uint32_t uptime_s(void) /* ms ticks wrap every 49 days: add up the steps instead */
@@ -570,12 +587,14 @@ static void extras_apply(void)
     bool rune = TH_IS_AMULET; /* in every menu style: it lies behind the rows and the icons */
     for (int i = 0; i < RUNE_N; i++) lv_obj_set_flag(sh.rune[i], LV_OBJ_FLAG_HIDDEN, !rune);
     if (rune_timer) lv_timer_delete(rune_timer), rune_timer = NULL;
+    rune_live = false;
     if (rune) {
         rune_flare = rune_motion = 0;
         rune_mix = 0; /* force a repaint */
         rune_move(0, 0);
         rune_paint(0.2f);
-        rune_timer = lv_timer_create(rune_step, 33, NULL);
+        rune_timer = lv_timer_create(rune_step, 33, NULL); /* pauses itself as soon as the menu is not what is on screen */
+        rune_live = true, rune_last = 0;
     }
     lv_obj_set_flag(sh.clock_lbl, LV_OBJ_FLAG_HIDDEN, !TH_IS_AMULET);
     lv_obj_set_style_text_font(sh.clock_lbl, th->small, 0);
@@ -705,6 +724,7 @@ static void go(lv_obj_t *scr, lv_screen_load_anim_t anim, uint32_t ms, bool dele
 
 static void show_menu(lv_screen_load_anim_t anim)
 {
+    rune_wake();
     layout();
     go(sh.menu_scr, anim, 250, false);
 }
@@ -772,6 +792,7 @@ static void back_to_menu(void)
         while (lo > app_count && apps[lo - 1].group && !strcmp(apps[lo - 1].group, group)) lo--;
         group_enter(group, i - lo);
     }
+    rune_wake();
     layout();
     go(sh.menu_scr, LV_SCREEN_LOAD_ANIM_MOVE_BOTTOM, 250, true); /* the app's screen goes when the slide is done */
 }
@@ -885,12 +906,14 @@ void shell_imu(float ax, float ay, float az, float dt)
     if (!pip_display_on() && lv_screen_active() != sh.pip_scr && !awake && !phone_where()) shell_home(); /* asleep: back to his face */
     pip_shake_ok(sh.open < 0 || !apps[sh.open].imu); /* shaking a die is not shaking him */
     pip_imu(ax, ay, az, dt);
+    if (rune_timer && !rune_live && lv_screen_active() == sh.menu_scr && pip_display_on()) rune_wake(); /* safety net */
     shell_rune_motion(ax, ay, az, dt); /* "Амулет": a sharp move makes the rune flare */
     if (sh.open >= 0 && apps[sh.open].imu) apps[sh.open].imu(ax, ay, az, dt);
 }
 
 void shell_create(void)
 {
+    LV_ASSERT(app_total <= 24); /* sh.icons / rows / lens_rows / scroll_cells and row_mask are sized for 24 */
     sh.pip_scr = lv_screen_active();
     pip_create(sh.pip_scr);
     pip_on_swipe(from_pip);
@@ -985,6 +1008,7 @@ void shell_create(void)
     lv_obj_add_event_cb(sh.menu_scr, menu_input, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(sh.menu_scr, menu_input, LV_EVENT_RELEASED, NULL);
     sh.glide = lv_timer_create(hex_glide, 16, NULL);
+    lv_timer_pause(sh.glide); /* runs only while a flick is gliding */
     restyle_menu();
     apps_init();
 }

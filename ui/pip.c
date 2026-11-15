@@ -199,6 +199,19 @@ static struct {
     bool eco;
 } s = {.bat_pct = -1, .intro = -1, .last_bang = -10}; /* the battery is unknown until the power chip says */
 
+/* the frame timer: full speed while the face is on the glass, slow while nobody can see it (dark, or an app is open) */
+static lv_timer_t *tick_timer;
+static uint32_t tick_ms;
+#define TICK_FULL_MS (face_start ? 4 : 16)
+#define TICK_HIDDEN_MS 33
+#define TICK_DARK_MS 200
+static void tick_period(uint32_t ms)
+{
+    if (!tick_timer || ms == tick_ms) return;
+    tick_ms = ms;
+    lv_timer_set_period(tick_timer, ms);
+}
+
 static float frand(float a, float b) { return a + (b - a) * (float)lv_rand(0, 10000) / 10000.0f; }
 static void blink(void) { s.blink_t = 0; }
 const char *pip_mood_name(int mood) { return moods[mood].name; }
@@ -236,7 +249,8 @@ static int mood_voice(int mood)
 #define ECO_FRAME_MS 50 /* energy saving: at most 20 frames a second (the face is most of the battery after the panel) */
 void pip_eco(bool on) { s.eco = on; }
 bool pip_eco_on(void) { return s.eco; }
-bool pip_mic_wanted(void) { return HEARS(PIP_F_BLOW) || HEARS(PIP_F_NOISE); }
+/* dark or asleep he reacts to neither a breath nor a bang (see update): the mic stays off */
+bool pip_mic_wanted(void) { return !s.dark && !s.pet.asleep && (HEARS(PIP_F_BLOW) || HEARS(PIP_F_NOISE)); }
 void pip_feature(int f, bool on) { s.feat_off = on ? s.feat_off & ~(1u << f) : s.feat_off | 1u << f; }
 bool pip_feature_on(int f) { return FEAT(f); }
 void *pip_pet(void) { return &s.pet; }
@@ -327,7 +341,7 @@ void pip_wake(void) { light_up(); } /* something to look at came: a notification
 void pip_note(void)
 {
     light_up();
-    s.notes[s.note_i++ % 8] = s.t;
+    s.notes[s.note_i++ & 7] = s.t;
     int n = 0;
     for (int i = 0; i < 8; i++) n += s.notes[i] > 0 && s.t - s.notes[i] < pet_tune.flood_s;
     if (n < pet_tune.flood_n || s.pet.asleep) return;
@@ -359,6 +373,7 @@ static void light_up(void)
 {
     pw.idle = 0, pw.dozed = pw.dim = false;
     s.dark = false;
+    tick_period(TICK_FULL_MS); /* back to full speed at once, not at the next slow tick */
     s.dark_in = s.imu.face_down && FEAT(PIP_F_FACEDOWN) ? DARK_AGAIN_S : 0;
 }
 
@@ -441,7 +456,7 @@ void pip_imu(float ax, float ay, float az, float dt)
     if (!FEAT(PIP_F_FACEDOWN)) ev &= ~(IMU_FACE_DOWN | IMU_FACE_UP);
     if (ev & IMU_FACE_DOWN) { react(PIP_ASLEEP, INFINITY, "face down"); pet_event(&s.pet, PET_SLEEP); s.dark_in = DARK_AFTER_S; }
     if (ev & IMU_FACE_UP) {
-        s.dark = false, s.dark_in = 0;
+        s.dark = false, s.dark_in = 0, tick_period(TICK_FULL_MS);
         int r = pet_event(&s.pet, PET_WAKE);
         react(r >= 0 ? r : PIP_SURPRISED, 1.5f, "woke up");
         blink();
@@ -521,9 +536,13 @@ static const float crack_def[2][CRACK_N][2] = { /* in eye widths, from the eye's
 static void rage_fx(int level, float dt)
 {
     (void)dt;
-    lv_obj_set_flag(s.rage_ring, LV_OBJ_FLAG_HIDDEN, level == 0);
-    for (int i = 0; i < 2; i++)
-        for (int c = 0; c < 2; c++) lv_obj_set_flag(s.crack[i][c], LV_OBJ_FLAG_HIDDEN, level < 2);
+    static int shown_level = -1; /* flags only on a change: each call invalidates the object */
+    if (level != shown_level) {
+        shown_level = level;
+        lv_obj_set_flag(s.rage_ring, LV_OBJ_FLAG_HIDDEN, level == 0);
+        for (int i = 0; i < 2; i++)
+            for (int c = 0; c < 2; c++) lv_obj_set_flag(s.crack[i][c], LV_OBJ_FLAG_HIDDEN, level < 2);
+    }
     if (level == 0) return;
     /* a ragged flicker: two beats of different speeds and a jolt now and then */
     float fl = 0.55f + 0.25f * sinf(s.t * 17) + 0.15f * sinf(s.t * 41 + 1) + (lv_rand(0, 99) < 8 ? 0.25f : 0);
@@ -571,7 +590,7 @@ static void effects(int fx, float dt)
     rage_fx(fx == FX_RAGE ? 2 : fx == FX_FURY ? 1 : 0, dt);
     animate(swear, N_SWEAR, dt);
     animate(drops, N_DROPS, dt);
-    lv_obj_set_pos(s.rain_cloud, SCR / 2 - 85 + (int32_t)(sinf(s.t * 0.7f) * 10), 26); /* the cloud drifts a little */
+    if (fx == FX_RAIN) lv_obj_set_pos(s.rain_cloud, SCR / 2 - 85 + (int32_t)(sinf(s.t * 0.7f) * 10), 26); /* the cloud drifts a little */
 }
 
 static void step(float dt, const mood_def_t *m, bool dizzy)
@@ -665,10 +684,11 @@ static void update(float dt)
             static const char *const said[PIP_MOOD_COUNT] = {[PIP_LOVE] = "likes you", [PIP_SHY] = "shy", [PIP_SUSPICIOUS] = "wary",
                                                              [PIP_ANGRY] = "dislikes you", [PIP_BELLIGERENT] = "dislikes you"};
             int r = pet_meet(&s.pet, (int)lv_rand(0, 99));
-            react(r, 3.0f, said[r]);
+            if (r >= 0 && r < PIP_MOOD_COUNT) react(r, 3.0f, said[r] ? said[r] : "meet"); /* said[] has gaps: never a NULL name */
         }
     }
     int mood = s.react_mood >= 0 ? s.react_mood : s.mood;
+    if ((unsigned)mood >= PIP_MOOD_COUNT) mood = PIP_NEUTRAL;
     if (mood != s.shown) {
         /* his own mood swings get a comment now and then, not every time */
         if (s.react_mood < 0 && s.t - s.last_voice > 15 && lv_rand(0, 100) < 35) say(mood_voice(mood));
@@ -746,7 +766,11 @@ static void update(float dt)
     s.tgy = fmaxf(-1.0f, fminf(1.0f, s.tgy));
 
     for (float left = dt; left > 0; left -= 1.0f / 120) step(fminf(left, 1.0f / 120), m, mood == PIP_DIZZY && s.intro < 0);
-    lv_obj_set_flag(s.canvas, LV_OBJ_FLAG_HIDDEN, s.intro >= 0 && s.intro < 0.8f); /* black until he stirs */
+    { /* black until he stirs; set only on a change: a flag call invalidates the whole canvas */
+        static int canvas_hidden = -1;
+        int want = s.intro >= 0 && s.intro < 0.8f;
+        if (want != canvas_hidden) lv_obj_set_flag(s.canvas, LV_OBJ_FLAG_HIDDEN, want), canvas_hidden = want;
+    }
     if (s.intro >= 3.0f) { /* the shake: the head whips side to side, fading out */
         float k = 1 - (s.intro - 3.0f) / 0.8f;
         s.head_yaw.x = sinf(s.intro * 34) * 0.45f * k, s.head_roll.x = sinf(s.intro * 27) * 0.25f * k;
@@ -810,8 +834,9 @@ static void update(float dt)
                                                  (uint8_t)(fminf(fmaxf(s.tint[2].x, 0), 1) * 255)));
     s.face.blush = fmaxf(s.blush.x, 0);
     /* the screen is dark: no rain, no bobbing "?" - they would keep LVGL drawing for nobody */
-    effects(s.dark ? FX_NONE : m->fx, dt);
-    const char *text = s.dark ? NULL : m->text;
+    bool unseen = s.dark || lv_obj_get_screen(s.canvas) != lv_screen_active(); /* asleep, or an app is open */
+    effects(unseen ? FX_NONE : m->fx, dt);
+    const char *text = unseen ? NULL : m->text;
 
     /* text above the eyes: swearing shakes, a question mark bobs */
     if (text != s.text_shown) {
@@ -996,6 +1021,9 @@ float pip_frame_worst(int secs, const char **mood, const char **reaction)
     return k < 0 ? 0 : worst[k].ms;
 }
 
+/* the least time between two frames: energy saving, or a sleeping face that barely moves, draws at most 15-20 a second */
+static uint32_t frame_gap(void) { return s.eco ? ECO_FRAME_MS : (s.pet.asleep || s.shown == PIP_ASLEEP) ? 66 : 0; }
+
 static void tick_cb(lv_timer_t *t)
 {
     (void)t;
@@ -1004,8 +1032,10 @@ static void tick_cb(lv_timer_t *t)
     update(fminf(el / 1000.0f, 0.1f));
     if (s.dark || lv_obj_get_screen(s.canvas) != lv_screen_active()) { /* dark, or an app is open: keep living, skip drawing */
         s.last_swap = lv_tick_get(); /* and the time away is no slow frame */
+        tick_period(s.dark ? TICK_DARK_MS : TICK_HIDDEN_MS);
         return;
     }
+    tick_period(TICK_FULL_MS);
     if (face_start) { /* the firmware draws the next frame in the background while LVGL shows this one */
         if (face_busy) return;
         if (s.pending) { /* it is ready: swap the canvases and redraw where the eyes were and are */
@@ -1019,7 +1049,7 @@ static void tick_cb(lv_timer_t *t)
             frame_took((float)lv_tick_elaps(s.last_swap));
             s.last_swap = lv_tick_get();
         }
-        if (s.eco && lv_tick_elaps(s.last_draw) < ECO_FRAME_MS) return; /* the cores rest until the next frame is due */
+        if (lv_tick_elaps(s.last_draw) < frame_gap()) return; /* the cores rest until the next frame is due */
         s.last_draw = lv_tick_get();
         s.rface = s.face; /* this moment's eyes, drawn over what the back canvas held two frames ago */
         memcpy(s.rface.drawn, s.back_rects, sizeof s.rface.drawn);
@@ -1027,7 +1057,7 @@ static void tick_cb(lv_timer_t *t)
         face_start(&s.rface, (uint16_t *)s.back->data, SCR, SCR);
         return;
     }
-    if (s.eco && lv_tick_elaps(s.last_draw) < ECO_FRAME_MS) return;
+    if (lv_tick_elaps(s.last_draw) < frame_gap()) return;
     s.last_draw = lv_tick_get();
     face_rect_t was[4];
     memcpy(was, s.face.drawn, sizeof was);
@@ -1159,7 +1189,7 @@ void pip_create(lv_obj_t *parent)
     s.blink_t = -1;
     s.next_blink = 2;
     s.last_tick = lv_tick_get();
-    lv_timer_create(tick_cb, face_start ? 4 : 16, NULL); /* in the background mode a finished frame is picked up quickly */
+    tick_timer = lv_timer_create(tick_cb, tick_ms = TICK_FULL_MS, NULL); /* in the background mode a finished frame is picked up quickly */
 }
 
 void pip_glance(float x, float y, float secs)

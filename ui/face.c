@@ -151,6 +151,9 @@ static void eye_prepare(const face_t *f, const eye_t *e, int w, int h, eye_setup
     v3 p0 = v3sub(c0, v3s(d, dot(c0, d) / dd)), p1 = v3sub(c1, v3s(d, dot(c1, d) / dd));
     float A = dot(p0, p0), B = dot(p0, p1), C = dot(p1, p1), det = A * C - B * B; /* silhouette: A x^2 + 2Bxy + C y^2 = 1 */
     float ext_x = sqrtf(C / det), ext_y = sqrtf(A / det);
+    /* a degenerate pose (det ~ 0, NaN) must not turn into an infinite box: the casts below would be undefined */
+    if (!(ext_x >= 0.5f)) ext_x = 0.5f; else if (ext_x > 2048.0f) ext_x = 2048.0f;
+    if (!(ext_y >= 0.5f)) ext_y = 0.5f; else if (ext_y > 2048.0f) ext_y = 2048.0f;
     s->cr = cr, s->sr = sr, s->A = A, s->B = B, s->C = C, s->ext_x = ext_x, s->ext_y = ext_y, s->a = a, s->b = b;
     s->c0 = c0, s->c1 = c1, s->d = d, s->dd = dd;
 
@@ -188,8 +191,9 @@ static void eye_prepare(const face_t *f, const eye_t *e, int w, int h, eye_setup
 
     float pad = 2 + fabsf(e->wobble); /* the living outline reaches past the ellipse */
     float bx = ext_x * (1 + fabsf(taper)) + pad, by = ext_y + pad;
-    face_rect_t r = {maxi(0, (int)floorf(e->x - bx)), maxi(0, (int)floorf(e->y - by)),
-                     mini(w - 1, (int)ceilf(e->x + bx)), mini(h - 1, (int)ceilf(e->y + by))};
+    float ecx = fminf(fmaxf(e->x, -4096.0f), 4096.0f), ecy = fminf(fmaxf(e->y, -4096.0f), 4096.0f); /* fmaxf drops a NaN */
+    face_rect_t r = {maxi(0, (int)floorf(ecx - bx)), maxi(0, (int)floorf(ecy - by)),
+                     mini(w - 1, (int)ceilf(ecx + bx)), mini(h - 1, (int)ceilf(ecy + by))};
     if (r.x2 - r.x1 >= MAX_W) r.x2 = r.x1 + MAX_W - 1;
     s->r = r;
     s->grad_hint = 1.0f / (fminf(a, b) * 0.5f);
@@ -278,7 +282,7 @@ FACE_HOT static void eye_rows(const face_t *f, const eye_t *e, const eye_setup_t
     pupil_line_t *lines = band->lines;
     const face_rect_t P = s->pupil;
     const int pbw = (P.x2 - P.x1 + 2) / 2;
-    const bool blocks = e->spiral <= 0 && pbw <= PB_MAX;
+    const bool blocks = e->spiral <= 0 && pbw >= 0 && pbw <= PB_MAX;
     lines[0].y = lines[1].y = -100000;
 
     const float inv_dd = s->inv_dd;
@@ -518,11 +522,11 @@ FACE_HOT static void closed_rows(const face_t *f, const eye_t *e, const eye_setu
     /* the shut lid, in the eye's rolled frame (v down): a near-straight, stern line that follows the brow's slant (e->tilt)
        with only a faint sag in the middle (at most 3 px) - no curl at the ends, so it never reads as a smile.
        Asleep (tilt 0) it is a level line, like the left eye's closed slit. */
-    const float hw = ex * 0.92f, depth = mn(3.0f, 0.05f * ey), ht = mx(1.8f, 0.07f * ey), inv_hw = 1.0f / hw;
+    const float hw = mx(ex * 0.92f, 1.0f), depth = mn(3.0f, 0.05f * ey), ht = mx(1.8f, 0.07f * ey), inv_hw = 1.0f / hw;
     const float slope = mx(-0.45f, mn(0.45f, e->tilt)) * 0.6f;
     /* scar: a segment from upper left to lower right */
     const float ax = -0.5f * ex, ay = -0.85f * ey, bx = 0.5f * ex, by = 0.85f * ey;
-    const float bax = bx - ax, bay = by - ay, inv_ba2 = 1.0f / (bax * bax + bay * bay), sw_max = mx(1.2f, 0.045f * ey);
+    const float bax = bx - ax, bay = by - ay, inv_ba2 = 1.0f / mx(bax * bax + bay * bay, 1e-4f), sw_max = mx(1.2f, 0.045f * ey);
     face_rect_t r = s->r;
     if (y0 < r.y1) y0 = r.y1;
     if (y1 > r.y2 + 1) y1 = r.y2 + 1;
@@ -562,7 +566,7 @@ FACE_HOT static void blush_rows(const face_t *f, const eye_t *e, uint16_t *buf, 
 {
     float rx, ry, cx, cy;
     face_rect_t r = blush_rect(e, w, h, &rx, &ry, &cx, &cy);
-    float irx = 1.0f / rx, iry = 1.0f / ry;
+    float irx = 1.0f / mx(rx, 1.0f), iry = 1.0f / mx(ry, 1.0f);
     for (int y = maxi(r.y1, y0); y <= r.y2 && y < y1; y++)
         for (int x = r.x1; x <= r.x2; x++) {
             float nx = (x + 0.5f - cx) * irx, ny = (y + 0.5f - cy) * iry;
