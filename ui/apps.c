@@ -15,6 +15,11 @@
 #include <time.h>
 
 #define SCR 466
+/* what the games wear in "Амулет" and "Багровый" (TH_IS_RED): TH_RED is the deep red of the frames and grids */
+#define RED_HOT 0xD0202Cu     /* saturated crimson: the things you play with */
+#define RED_SCARLET 0xFF2B2Bu /* bright scarlet: crosses, pips, the prediction */
+#define RED_ASH 0xB9B2B2u     /* ashen grey: noughts */
+#define RED_BLACK 0x0C0404u   /* black with a breath of red, so shaded faces still read */
 
 static lv_obj_t *dot(lv_obj_t *parent, int x, int y, int size, uint32_t color)
 {
@@ -845,7 +850,7 @@ static void game_ring(void)
 {
     if (!TH_TERMINAL) {
         lv_arc_set_value(gm.ring, gm.left_ms * 1000 / ROUND_MS);
-        lv_obj_set_style_arc_color(gm.ring, lv_color_hex(gm.flash_ms > 0 ? 0xFF4245 : th->accent), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(gm.ring, lv_color_hex(gm.flash_ms > 0 ? 0xFF4245 : TH_IS_RED ? RED_HOT : th->accent), LV_PART_INDICATOR);
         return;
     }
     int lit = (int)((gm.left_ms * 60 + ROUND_MS - 1) / ROUND_MS);
@@ -1005,9 +1010,10 @@ static void game_open(lv_obj_t *scr)
     }
     gm.score = th_text(scr, th->digits, th->faint, "0");
     lv_obj_center(gm.score);
-    gm.star = th_text(scr, th->body, th == &themes[TH_APPLE] ? 0xFF375F : th->accent, "\xEF\x80\x84"); /* U+F004, a heart */
+    uint32_t ball_ink = TH_IS_RED ? RED_HOT : th->text; /* red themes: the ball and the hearts in saturated crimson on black */
+    gm.star = th_text(scr, th->body, TH_IS_RED ? RED_HOT : th == &themes[TH_APPLE] ? 0xFF375F : th->accent, "\xEF\x80\x84"); /* U+F004, a heart */
     lv_obj_set_size(gm.star, 44, 44);
-    gm.ball = th->radius ? dot(scr, SCR / 2, SCR / 2, 44, th->text) : th_box(scr, SCR / 2 - 20, SCR / 2 - 20, 40, 40, 0, th->text);
+    gm.ball = th->radius ? dot(scr, SCR / 2, SCR / 2, 44, ball_ink) : th_box(scr, SCR / 2 - 20, SCR / 2 - 20, 40, 40, 0, ball_ink);
     gm.over = th_text(scr, th->body, th->text, "");
     lv_obj_set_style_bg_color(gm.over, lv_color_hex(th->panel), 0);
     lv_obj_set_style_bg_opa(gm.over, LV_OPA_90, 0);
@@ -1037,6 +1043,7 @@ static const int mz_sizes[] = {6, 8, 10, 12};
 static struct {
     maze_t m;
     lv_obj_t *walls, *ball, *goal, *label;
+    lv_obj_t *torch[2], *lit[2]; /* red themes: two round windows (a faint wide one, a bright narrow one) and the walls seen through them */
     lv_timer_t *timer;
     float bx, by, gx, gy, next_in; /* the hand's usual pose, the push now; next_in > 0: solved, the next one comes */
     bool calibrated;
@@ -1089,6 +1096,23 @@ static void mz_place(lv_obj_t *o, float x, float y) /* centre an object on a maz
                    (int32_t)lroundf((SCR - MZ_SIDE) / 2 + y) - lv_obj_get_height(o) / 2);
 }
 
+/* The torch: the walls are only seen within 55-65 px of the ball, the radius flickering. Each window is a round clipped
+   box holding a copy of the walls' image, shifted so it lines up with the maze: moving two small windows is cheap,
+   redrawing the image for every step would not be. The wide one is faint, the narrow one full: a soft edge. */
+static void mz_torch(void)
+{
+    uint32_t ms = lv_tick_get() % 100000;
+    float R = 60 + 3.5f * sinf(ms * 0.011f) + 1.5f * sinf(ms * 0.037f); /* 55..65 */
+    const float rad[2] = {R, R * 0.7f};
+    int cx = (int)lroundf((SCR - MZ_SIDE) / 2 + mz.m.x), cy = (int)lroundf((SCR - MZ_SIDE) / 2 + mz.m.y);
+    for (int k = 0; k < 2; k++) {
+        int d = (int)(rad[k] * 2), ox = cx - d / 2, oy = cy - d / 2;
+        lv_obj_set_size(mz.torch[k], d, d);
+        lv_obj_set_pos(mz.torch[k], ox, oy);
+        lv_obj_set_pos(mz.lit[k], (SCR - MZ_IMG) / 2 - ox, (SCR - MZ_IMG) / 2 - oy);
+    }
+}
+
 static void mz_new(void)
 {
     maze_new(&mz.m, mz_sizes[mz.level], MZ_SIDE, lv_rand(1, 0x7FFFFFFF));
@@ -1099,6 +1123,7 @@ static void mz_new(void)
     lv_obj_set_size(mz.goal, g, g);
     mz_place(mz.goal, (mz.m.n - 0.5f) * mz.m.c, (mz.m.n - 0.5f) * mz.m.c);
     mz_place(mz.ball, mz.m.x, mz.m.y);
+    if (TH_IS_RED) mz_torch();
     char s[48];
     if (TH_TERMINAL) snprintf(s, sizeof s, "угрюм // лабиринт %d/4", mz.level + 1);
     else snprintf(s, sizeof s, "уровень %d", mz.level + 1);
@@ -1116,6 +1141,7 @@ static void mz_tick(lv_timer_t *t)
     }
     maze_step(&mz.m, mz.gx * MZ_PUSH, mz.gy * MZ_PUSH, dt);
     mz_place(mz.ball, mz.m.x, mz.m.y);
+    if (TH_IS_RED) mz_torch();
     if (maze_done(&mz.m)) {
         mz.solved++, mz.next_in = 0.8f;
         voice_say(VOICE_HAPPY);
@@ -1150,6 +1176,21 @@ static void mz_open(lv_obj_t *scr)
     lv_obj_set_pos(mz.walls, (SCR - MZ_IMG) / 2, (SCR - MZ_IMG) / 2);
     lv_obj_set_style_image_recolor(mz.walls, lv_color_hex(TH_TERMINAL ? th->dim : th->text), 0);
     lv_obj_set_style_image_recolor_opa(mz.walls, LV_OPA_COVER, 0);
+    if (TH_IS_RED) { /* the torch: the whole-maze image stays hidden, only what the windows show is seen */
+        lv_obj_add_flag(mz.walls, LV_OBJ_FLAG_HIDDEN);
+        for (int k = 0; k < 2; k++) {
+            lv_obj_t *w = mz.torch[k] = lv_obj_create(scr);
+            lv_obj_remove_style_all(w);
+            lv_obj_remove_flag(w, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_radius(w, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_clip_corner(w, true, 0);
+            lv_obj_t *im = mz.lit[k] = lv_image_create(w);
+            lv_image_set_src(im, mz_buf);
+            lv_obj_set_style_image_recolor(im, lv_color_hex(TH_RED), 0); /* dark crimson walls */
+            lv_obj_set_style_image_recolor_opa(im, LV_OPA_COVER, 0);
+            lv_obj_set_style_image_opa(im, k ? LV_OPA_COVER : LV_OPA_40, 0);
+        }
+    }
     if (TH_TERMINAL) {
         mz.label = th_header(scr, "", 40);
         th_footer(scr, TH_UP " новый   " TH_DOWN " назад", 404);
@@ -1160,6 +1201,13 @@ static void mz_open(lv_obj_t *scr)
         lv_obj_align(mz.label, LV_ALIGN_TOP_MID, 0, 34);
         mz.goal = dot(scr, 0, 0, 12, th == &themes[TH_APPLE] ? 0xFF375F : th->accent);
         mz.ball = dot(scr, 0, 0, 10, th->text);
+        if (TH_IS_RED) { /* the way out glows a dim scarlet, seen from anywhere in the dark */
+            recolor(mz.goal, 0xC8281E);
+            lv_obj_set_style_bg_opa(mz.goal, 190, 0);
+            lv_obj_set_style_shadow_width(mz.goal, 16, 0);
+            lv_obj_set_style_shadow_color(mz.goal, lv_color_hex(0xC8281E), 0);
+            lv_obj_set_style_shadow_opa(mz.goal, 110, 0);
+        }
     }
     lv_obj_remove_flag(mz.ball, LV_OBJ_FLAG_CLICKABLE);
     mz_new();
@@ -1704,7 +1752,7 @@ static void xo_draw(void)
         bool on = i == xo.mode;
         lv_obj_set_style_bg_opa(xo.chips[i], on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(xo.chips[i], on ? 0 : 2, 0);
-        lv_obj_set_style_text_color(lv_obj_get_child(xo.chips[i], 0), lv_color_hex(on ? th->bg : th->dim), 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(xo.chips[i], 0), lv_color_hex(on ? (TH_IS_RED ? th->text : th->bg) : th->dim), 0);
     }
 }
 
@@ -1768,10 +1816,11 @@ static void xo_mode(lv_event_t *e)
 static void xo_open(lv_obj_t *scr)
 {
     int x0 = SCR / 2 - 144, y0 = SCR / 2 - 144;
-    uint32_t o_ink = TH_TERMINAL ? th->dim : th->accent;
+    uint32_t o_ink = TH_IS_RED ? RED_ASH : TH_TERMINAL ? th->dim : th->accent;
+    uint32_t grid_ink = TH_IS_RED ? TH_RED : th->faint, x_ink = TH_IS_RED ? RED_SCARLET : th->text; /* red themes: dark-red grid, scarlet crosses, ashen noughts */
     for (int i = 1; i < 3; i++) { /* the grid */
-        th_box(scr, x0 + i * 96 - 2, y0 + 10, 4, 288 - 20, 2, th->faint);
-        th_box(scr, x0 + 10, y0 + i * 96 - 2, 288 - 20, 4, 2, th->faint);
+        th_box(scr, x0 + i * 96 - 2, y0 + 10, 4, 288 - 20, 2, grid_ink);
+        th_box(scr, x0 + 10, y0 + i * 96 - 2, 288 - 20, 4, 2, grid_ink);
     }
     static lv_point_precise_t diag[2][2] = {{{0, 0}, {48, 48}}, {{48, 0}, {0, 48}}};
     for (int c = 0; c < 9; c++) {
@@ -1781,7 +1830,7 @@ static void xo_open(lv_obj_t *scr)
             lv_line_set_points(l, diag[k], 2);
             lv_obj_set_style_line_width(l, 8, 0);
             lv_obj_set_style_line_rounded(l, th->radius > 0, 0);
-            lv_obj_set_style_line_color(l, lv_color_hex(th->text), 0);
+            lv_obj_set_style_line_color(l, lv_color_hex(x_ink), 0);
             lv_obj_set_pos(l, cx - 24, cy - 24);
         }
         lv_obj_t *o = xo.o[c] = th_box(scr, cx - 28, cy - 28, 56, 56, th->radius ? LV_RADIUS_CIRCLE : 0, th->bg);
@@ -1828,8 +1877,9 @@ static const char *const eight_says[] = {
 static struct {
     lv_obj_t *ball, *eight, *tri, *says;
     lv_draw_buf_t *tri_buf;
+    lv_timer_t *pulse; /* red themes: the rim breathes */
     float rest;
-    bool asking;
+    bool asking, tri_red; /* tri_red: which colour the triangle's image was drawn in */
 } e8;
 
 static void e8_shake_exec(void *o, int32_t v) /* the ball rocks, less and less */
@@ -1885,9 +1935,17 @@ static void e8_imu(float ax, float ay, float az, float dt) { if (jolt(ax, ay, az
 
 static void e8_close(void)
 {
+    if (e8.pulse) lv_timer_delete(e8.pulse), e8.pulse = NULL;
     lv_anim_delete(e8.eight, e8_shake_exec);
     lv_anim_delete(e8.tri, e8_float_exec);
     e8.asking = false;
+}
+
+static void e8_pulse(lv_timer_t *t) /* the crimson rim, between a quarter and the full #9E1B1B, 2.4 s a breath */
+{
+    (void)t;
+    float s = 0.5f - 0.5f * cosf((lv_tick_get() % 2400) * (6.2831853f / 2400));
+    lv_obj_set_style_border_color(e8.ball, lv_color_mix(lv_color_hex(TH_RED), lv_color_black(), (uint8_t)(70 + 185 * s)), 0);
 }
 
 static float edge(float px, float py, float x1, float y1, float x2, float y2) /* signed distance, inside positive */
@@ -1899,33 +1957,37 @@ static void e8_open(lv_obj_t *scr)
 {
     e8.rest = 0.5f, e8.asking = false;
     /* the window of the ball: a dark disc; the triangle of the die inside, point down, drawn once */
-    lv_obj_t *b = e8.ball = th_box(scr, SCR / 2 - 190, SCR / 2 - 190, 380, 380, LV_RADIUS_CIRCLE, 0x0A0A1E);
-    lv_obj_set_style_border_width(b, 3, 0);
-    lv_obj_set_style_border_color(b, lv_color_hex(0x1E1E3C), 0);
-    lv_obj_t *disc = e8.eight = th_box(b, 190 - 80, 190 - 80, 160, 160, LV_RADIUS_CIRCLE, 0xF2F2F2);
-    lv_obj_t *n8 = th_text(disc, th->digits, 0x0A0A1E, "8");
+    bool red = TH_IS_RED; /* red themes: a black ball with a pulsing crimson rim, the prediction in red */
+    lv_obj_t *b = e8.ball = th_box(scr, SCR / 2 - 190, SCR / 2 - 190, 380, 380, LV_RADIUS_CIRCLE, red ? 0x000000 : 0x0A0A1E);
+    lv_obj_set_style_border_width(b, red ? 5 : 3, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(red ? TH_RED : 0x1E1E3C), 0);
+    lv_obj_t *disc = e8.eight = th_box(b, 190 - 80, 190 - 80, 160, 160, LV_RADIUS_CIRCLE, red ? 0x140606 : 0xF2F2F2);
+    lv_obj_t *n8 = th_text(disc, th->digits, red ? RED_SCARLET : 0x0A0A1E, "8");
     lv_obj_center(n8);
     const int tw = 300, tht = 250;
-    if (!e8.tri_buf) {
-        e8.tri_buf = lv_draw_buf_create(tw, tht, LV_COLOR_FORMAT_ARGB8888, 0);
+    if (!e8.tri_buf || e8.tri_red != red) { /* drawn once per colour */
+        if (!e8.tri_buf) e8.tri_buf = lv_draw_buf_create(tw, tht, LV_COLOR_FORMAT_ARGB8888, 0);
+        e8.tri_red = red;
+        const uint32_t tri_ink = red ? 0x1A0505 : 0x2B3BBF;
         uint32_t *px = (uint32_t *)e8.tri_buf->data;
         for (int y = 0; y < tht; y++)
             for (int x = 0; x < tw; x++) { /* inside all three edges, antialiased by the nearest one */
                 float d = fminf(edge(x + 0.5f, y + 0.5f, 2, 2, tw - 2, 2), fminf(edge(x + 0.5f, y + 0.5f, tw - 2, 2, tw / 2.0f, tht - 2),
                                                                              edge(x + 0.5f, y + 0.5f, tw / 2.0f, tht - 2, 2, 2)));
                 float a = d > 1 ? 1 : d < 0 ? 0 : d;
-                px[(size_t)y * (e8.tri_buf->header.stride / 4) + x] = (uint32_t)(a * 255) << 24 | 0x2B3BBF;
+                px[(size_t)y * (e8.tri_buf->header.stride / 4) + x] = (uint32_t)(a * 255) << 24 | tri_ink;
             }
     }
     e8.tri = lv_image_create(b);
     lv_image_set_src(e8.tri, e8.tri_buf);
     lv_obj_align(e8.tri, LV_ALIGN_CENTER, 0, 12);
-    e8.says = th_text(e8.tri, th->small, 0xFFFFFF, "");
+    e8.says = th_text(e8.tri, th->small, red ? RED_SCARLET : 0xFFFFFF, "");
     lv_obj_set_width(e8.says, 190);
     lv_label_set_long_mode(e8.says, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_line_space(e8.says, 2, 0);
     lv_obj_align(e8.says, LV_ALIGN_TOP_MID, 0, 26);
     lv_obj_add_flag(e8.tri, LV_OBJ_FLAG_HIDDEN);
+    if (red) e8.pulse = lv_timer_create(e8_pulse, 90, NULL); /* ~11 steps a second: the ball is big, so not every frame */
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, e8_tap, LV_EVENT_CLICKED, NULL);
 }
@@ -1970,9 +2032,10 @@ static void cn_landed(lv_anim_t *a)
     cn_exec(NULL, 1000);
     cn_show(cn.face);
     cn.count[cn.face]++;
-    lv_label_set_text(cn.word, th_label(cn.face ? "решка" : "орёл"));
+    const char *side[2] = {TH_IS_RED ? "клинок" : "орёл", TH_IS_RED ? "щит" : "решка"}; /* red themes: blade and shield */
+    lv_label_set_text(cn.word, th_label(side[cn.face]));
     char s[48];
-    snprintf(s, sizeof s, "орёл %d   решка %d", cn.count[0], cn.count[1]);
+    snprintf(s, sizeof s, "%s %d   %s %d", side[0], cn.count[0], side[1], cn.count[1]);
     lv_label_set_text(cn.tally, th_label(s));
     voice_say(VOICE_TICK);
 }
@@ -2000,14 +2063,16 @@ static void cn_close(void) { lv_anim_delete(&cn, cn_exec), cn.flying = false; }
 static void cn_open(lv_obj_t *scr)
 {
     cn.rest = 0.5f, cn.flying = false;
-    lv_obj_t *c = cn.coin = th_box(scr, SCR / 2 - 100, SCR / 2 - 120, 200, 200, LV_RADIUS_CIRCLE, 0xD9A441);
+    bool red = TH_IS_RED; /* red themes: a black coin in a crimson rim */
+    uint32_t mark = red ? TH_RED : 0x7A5517;
+    lv_obj_t *c = cn.coin = th_box(scr, SCR / 2 - 100, SCR / 2 - 120, 200, 200, LV_RADIUS_CIRCLE, red ? RED_BLACK : 0xD9A441);
     lv_obj_set_style_border_width(c, 10, 0);
-    lv_obj_set_style_border_color(c, lv_color_hex(0xB07F2A), 0);
+    lv_obj_set_style_border_color(c, lv_color_hex(red ? TH_RED : 0xB07F2A), 0);
     /* heads: Pip's own face; tails: a one */
     cn.heads = th_box(c, 0, 0, 200, 200, 0, 0);
     lv_obj_set_style_bg_opa(cn.heads, LV_OPA_TRANSP, 0);
-    for (int i = 0; i < 2; i++) cn.eyes[i] = th_box(cn.heads, 56 + i * 56, 70, 32, 46, LV_RADIUS_CIRCLE, 0x7A5517);
-    cn.tails = th_text(c, th->digits, 0x7A5517, "1");
+    for (int i = 0; i < 2; i++) cn.eyes[i] = th_box(cn.heads, 56 + i * 56, 70, 32, 46, LV_RADIUS_CIRCLE, mark);
+    cn.tails = th_text(c, th->digits, mark, "1");
     lv_obj_center(cn.tails);
     cn_show(cn.face);
     cn.word = th_text(scr, th->body, th->text, "");
@@ -2081,7 +2146,9 @@ static void dc_draw(float H) /* H: half the edge on screen, px */
     c0 = c0 < 0 ? 0 : c0, c1 = c1 > DIE_IMG ? DIE_IMG : c1;
     for (int y = c0; y < c1; y++) memset(px + y * stride + c0, 0, (size_t)(c1 - c0) * 4);
     dc.ext = (int)(H * 1.75f) + 2;
-    uint32_t body = th->text, pip = th->bg;
+    bool red = TH_IS_RED; /* red themes: a black die, a crimson frame round every face, scarlet pips */
+    uint32_t body = red ? RED_BLACK : th->text, pip = red ? RED_SCARLET : th->bg;
+    const float rim_at = red ? 0.9f : 0.93f;
     for (int f = 0; f < 6; f++) {
         float n[3];
         dc_world(f, n);
@@ -2096,6 +2163,7 @@ static void dc_draw(float H) /* H: half the edge on screen, px */
         /* flat shading: a light up and to the left, in front */
         float lit = 0.62f + 0.38f * fmaxf(0, -0.4f * n[0] - 0.5f * n[1] - 0.77f * n[2]);
         uint32_t r = (uint32_t)(((body >> 16) & 255) * lit), g = (uint32_t)(((body >> 8) & 255) * lit), bl = (uint32_t)((body & 255) * lit);
+        uint32_t fr = (uint32_t)(((TH_RED >> 16) & 255) * lit), fg = (uint32_t)(((TH_RED >> 8) & 255) * lit), fb = (uint32_t)((TH_RED & 255) * lit);
         float ext = fabsf(eu[0]) + fabsf(ev[0]), eyt = fabsf(eu[1]) + fabsf(ev[1]);
         int x0 = (int)fmaxf(0, cx - ext - 1), x1 = (int)fminf(DIE_IMG - 1, cx + ext + 1);
         int y0 = (int)fmaxf(0, cy - eyt - 1), y1 = (int)fminf(DIE_IMG - 1, cy + eyt + 1);
@@ -2118,10 +2186,13 @@ static void dc_draw(float H) /* H: half the edge on screen, px */
                     if (dd < r_in2) k = 1;
                     else if (dd < r_out2) k = (0.19f - sqrtf(dd)) * scale + 0.5f;
                 }
-                float rim = fabsf(u) > 0.93f || fabsf(v) > 0.93f ? 0.86f : 1; /* the edges a touch darker */
-                uint32_t cr = (uint32_t)((r * rim) * (1 - k) + ((pip >> 16) & 255) * k);
-                uint32_t cg = (uint32_t)((g * rim) * (1 - k) + ((pip >> 8) & 255) * k);
-                uint32_t cb = (uint32_t)((bl * rim) * (1 - k) + (pip & 255) * k);
+                bool on_rim = fabsf(u) > rim_at || fabsf(v) > rim_at;
+                float rim = on_rim ? 0.86f : 1; /* the edges a touch darker */
+                float br = r * rim, bgn = g * rim, bb = bl * rim;
+                if (red && on_rim) br = (float)fr, bgn = (float)fg, bb = (float)fb; /* ...or, in the red themes, the crimson frame */
+                uint32_t cr = (uint32_t)(br * (1 - k) + ((pip >> 16) & 255) * k);
+                uint32_t cg = (uint32_t)(bgn * (1 - k) + ((pip >> 8) & 255) * k);
+                uint32_t cb = (uint32_t)(bb * (1 - k) + (pip & 255) * k);
                 uint32_t *p = &px[y * stride + x], old = *p, oa = old >> 24;
                 uint32_t na = (uint32_t)(cov * 255);
                 if (oa && na < 255) { /* the seam with a face drawn before: blend over it */
