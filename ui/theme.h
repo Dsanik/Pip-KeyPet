@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-enum { TH_SILENCE, TH_INSTRUMENT, TH_APPLE, TH_DIAG, TH_COUNT };
+enum { TH_SILENCE, TH_INSTRUMENT, TH_APPLE, TH_DIAG, TH_AMULET, TH_CRIMSON, TH_COUNT }; /* new ones go last: the saved theme is an index */
 enum { ICONS_OUTLINE, ICONS_GLASS, ICONS_BLOCKS };      /* how app icons are drawn */
 enum { CLOCK_DOTS, CLOCK_DIAL, CLOCK_BIG, CLOCK_BLOCKS }; /* the clock app's face */
 enum { METER_DOTS, METER_SEGMENTS, METER_BAR, METER_BLOCKS };
@@ -36,6 +36,13 @@ void th_screen(lv_obj_t *scr);                        /* background colour and t
 
 /* ---------- "Диагностика": the terminal look, built from cells on an 11 px pitch (see the design canvas) ---------- */
 #define TH_TERMINAL (th == &themes[TH_DIAG])
+
+/* "Амулет" and "Багровый": black and one deep red, no other hue */
+#define TH_RED 0x9E1B1Bu
+#define TH_IS_AMULET (th == &themes[TH_AMULET])
+#define TH_IS_CRIMSON (th == &themes[TH_CRIMSON])
+#define TH_IS_RED (TH_IS_AMULET || TH_IS_CRIMSON)
+
 #define TH_UP "\xE2\x96\xB2" /* triangles for the hardware button hints, in the terminal fonts only */
 #define TH_DOWN "\xE2\x96\xBC"
 #define TH_LEFT "\xE2\x97\x80"

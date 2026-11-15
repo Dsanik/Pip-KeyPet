@@ -31,6 +31,16 @@ const theme_t themes[TH_COUNT] = {
                  .accent = 0xE6D8C3, .good = 0xE6D8C3, .grid = 0x5A3530, .mute = 0x8A6A60, .off = 0x4F2B26, .small = &font_diag_20, .body = &font_diag_28,
                  .digits = &font_diag_96, .big = &font_diag_56, .title = &font_diag_40, .tiny = &font_diag_16, .tiny_bold = &font_diag_16b, .button = &font_diag_20b, .caps = true, .radius = 0, .icons = ICONS_BLOCKS, .clock = CLOCK_BLOCKS,
                  .meter = METER_BLOCKS, .menu = MENU_LIST},
+    /* black ground, a pulsing crimson rune on the menu, the time small and dim at the bottom */
+    [TH_AMULET] = {.name = "Амулет", .bg = 0x000000, .text = 0xC9BDBD, .dim = 0x5E4848, .faint = 0x1E1111, .panel = 0x120909,
+                   .accent = TH_RED, .good = 0xC9BDBD, .small = &font_instr_20, .tiny = &font_instr_20, .tiny_bold = &font_instr_20, .body = &font_instr_28,
+                   .digits = &font_instr_96, .big = &font_instr_56, .title = &font_instr_40, .caps = true, .radius = 6, .icons = ICONS_OUTLINE, .clock = CLOCK_DIAL,
+                   .meter = METER_SEGMENTS, .menu = MENU_LIST},
+    /* strictly black and red: the orange of "Приборка" becomes #9E1B1B, and the menu carries a survival line */
+    [TH_CRIMSON] = {.name = "Багровый", .bg = 0x000000, .text = 0xC23B3B, .dim = 0x7A2323, .faint = 0x2B0F0F, .panel = 0x170909,
+                    .accent = TH_RED, .good = 0xC23B3B, .small = &font_instr_20, .tiny = &font_instr_20, .tiny_bold = &font_instr_20, .body = &font_instr_28,
+                    .digits = &font_instr_96, .big = &font_instr_56, .title = &font_instr_40, .caps = true, .radius = 6, .icons = ICONS_OUTLINE, .clock = CLOCK_DIAL,
+                    .meter = METER_SEGMENTS, .menu = MENU_LIST},
 };
 
 const theme_t *th = &themes[TH_INSTRUMENT];
@@ -102,7 +112,7 @@ lv_obj_t *th_button(lv_obj_t *parent, const char *text, bool primary, lv_event_c
         lv_obj_set_style_border_opa(b, LV_OPA_40, 0);
     }
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
-    uint32_t ink = primary && th != &themes[TH_APPLE] ? th->bg : th->text;
+    uint32_t ink = primary && th != &themes[TH_APPLE] && !TH_IS_RED ? th->bg : th->text; /* #9E1B1B is too dark for black text */
     lv_obj_t *l = th_text(b, th->button ? th->button : th->small, ink, text);
     lv_obj_center(l);
     return b;

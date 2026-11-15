@@ -19,6 +19,7 @@
 #define LENS_X 80          /* list: the focus plate, rows read through it */
 #define LENS_W 320
 #define LENS_H 56
+#define RUNE_N 6 /* "Амулет": the rune is six lv_line pieces */
 
 static struct {
     lv_obj_t *pip_scr, *menu_scr, *app_scr, *name;
@@ -27,6 +28,7 @@ static struct {
     bool updating;            /* shell_updating(): the screen stays lit until the reset */
     lv_obj_t *lens, *lens_rows[24], *lens_cursor, *chrome, *head, *scroll; /* the list's plate; the terminal's header and scroll cells */
     th_cell_t scroll_cells[24];
+    lv_obj_t *rune[RUNE_N], *clock_lbl, *surv_lbl, *bat_body, *bat_nub; /* "Амулет": the rune and the time; "Багровый": the survival line; both tint the battery */
     int tick_row; /* tick_row: the wheel clicks each time a new row reaches the middle */
     lv_draw_buf_t *sprites[ICON_COUNT];
     int open;  /* app index, -1 = none */
@@ -73,7 +75,8 @@ static void bat_show(void)
     if (!sh.bat) return;
     lv_obj_set_flag(sh.bat, LV_OBJ_FLAG_HIDDEN, bat.pct < 0);
     if (bat.pct < 0) return;
-    uint32_t c = bat.pct < 20 ? 0xFF453A : bat.pct < 50 ? 0xFF9F0A : 0x34C759;
+    uint32_t c = TH_IS_RED ? (bat.pct < 20 ? th->text : th->accent) /* the red themes have no orange or green */
+                 : bat.pct < 20 ? 0xFF453A : bat.pct < 50 ? 0xFF9F0A : 0x34C759;
     lv_obj_set_width(sh.bat_fill, 2 + 26 * bat.pct / 100);
     lv_obj_set_style_bg_color(sh.bat_fill, lv_color_hex(c), 0);
 }
@@ -439,6 +442,109 @@ static void list_input(lv_event_code_t code, lv_point_t p)
     }
 }
 
+/* ---------- "Амулет" and "Багровый": the rune, the time, the survival line ---------- */
+
+/* The rune is a 60 x 280 px figure centred on the screen: a long sharp diamond, a stem down its middle and a crossing
+   pair of diagonals above and below. Each piece is its own lv_line, with a RP px margin round its points so the stroke
+   is never clipped by the object's content box; the points are relative to the piece's own corner. */
+#define RP 3
+typedef struct { const lv_point_precise_t *p; uint32_t n; int x, y; } rune_line_t;
+static const lv_point_precise_t r_body[] = {{RP + 30, RP}, {RP + 60, RP + 140}, {RP + 30, RP + 280}, {RP, RP + 140}, {RP + 30, RP}};
+static const lv_point_precise_t r_stem[] = {{RP, RP}, {RP, RP + 280}};
+static const lv_point_precise_t r_xa[] = {{RP, RP}, {RP + 60, RP + 50}};
+static const lv_point_precise_t r_xb[] = {{RP + 60, RP}, {RP, RP + 50}};
+static const rune_line_t rune_lines[RUNE_N] = {
+    {r_body, 5, SCR / 2 - 30 - RP, SCR / 2 - 140 - RP}, {r_stem, 2, SCR / 2 - RP, SCR / 2 - 140 - RP},
+    {r_xa, 2, SCR / 2 - 30 - RP, SCR / 2 - 113 - RP},   {r_xb, 2, SCR / 2 - 30 - RP, SCR / 2 - 113 - RP}, /* the X above */
+    {r_xa, 2, SCR / 2 - 30 - RP, SCR / 2 + 63 - RP},    {r_xb, 2, SCR / 2 - 30 - RP, SCR / 2 + 63 - RP},  /* and below */
+};
+
+/* v runs 0..1000 up and down again; the rune breathes between a fifth and the full #9E1B1B */
+static void rune_pulse(void *var, int32_t v)
+{
+    (void)var;
+    static uint8_t last;
+    if (lv_screen_active() != sh.menu_scr) return; /* nobody sees it: no redraws */
+    float x = (v < 500 ? v : 1000 - v) / 500.0f;
+    x = x * x * (3 - 2 * x); /* eased at both ends */
+    uint8_t mix = (uint8_t)(50 + 205 * x);
+    if (mix == last) return;
+    last = mix;
+    lv_color_t c = lv_color_mix(lv_color_hex(TH_RED), lv_color_black(), mix);
+    for (int i = 0; i < RUNE_N; i++) lv_obj_set_style_line_color(sh.rune[i], c, 0);
+}
+
+static uint32_t uptime_s(void) /* ms ticks wrap every 49 days: add up the steps instead */
+{
+    static uint64_t up;
+    static uint32_t last;
+    uint32_t t = lv_tick_get();
+    up += (uint32_t)(t - last);
+    last = t;
+    return (uint32_t)(up / 1000);
+}
+
+const char *shell_survival_text(void)
+{
+    static char t[24];
+    uint32_t s = uptime_s();
+    if (s >= 86400) lv_snprintf(t, sizeof t, "%dд %02dч", (int)(s / 86400), (int)(s / 3600 % 24));
+    else if (s >= 3600) lv_snprintf(t, sizeof t, "%dч %02dм", (int)(s / 3600), (int)(s / 60 % 60));
+    else lv_snprintf(t, sizeof t, "%dм %02dс", (int)(s / 60), (int)(s % 60));
+    return t;
+}
+
+static void extras_refresh(void) /* the time and the survival line, as they change */
+{
+    if (!sh.clock_lbl) return;
+    char t[48];
+    if (TH_IS_AMULET) {
+        int64_t s = ((shell_local_time() % 86400) + 86400) % 86400;
+        if (sh.now) lv_snprintf(t, sizeof t, "%02d:%02d", (int)(s / 3600), (int)(s / 60 % 60));
+        else lv_snprintf(t, sizeof t, "--:--"); /* the host has not told the time yet */
+        if (strcmp(t, lv_label_get_text(sh.clock_lbl))) lv_label_set_text(sh.clock_lbl, t);
+    }
+    if (TH_IS_CRIMSON) {
+        lv_snprintf(t, sizeof t, "без срывов %s", shell_survival_text());
+        const char *u = th_label(t);
+        if (strcmp(u, lv_label_get_text(sh.surv_lbl))) lv_label_set_text(sh.surv_lbl, u);
+    }
+}
+
+/* everything the two red themes add to the menu, for the current theme and menu style: shown, hidden, tinted */
+static void extras_apply(void)
+{
+    bool rune = TH_IS_AMULET; /* in every menu style: it lies behind the rows and the icons */
+    for (int i = 0; i < RUNE_N; i++) lv_obj_set_flag(sh.rune[i], LV_OBJ_FLAG_HIDDEN, !rune);
+    lv_anim_delete(&sh, rune_pulse);
+    if (rune) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, &sh);
+        lv_anim_set_exec_cb(&a, rune_pulse);
+        lv_anim_set_values(&a, 0, 1000);
+        lv_anim_set_duration(&a, 3600); /* up and down in 3.6 s */
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_start(&a);
+        rune_pulse(&sh, 0);
+    }
+    lv_obj_set_flag(sh.clock_lbl, LV_OBJ_FLAG_HIDDEN, !TH_IS_AMULET);
+    lv_obj_set_style_text_font(sh.clock_lbl, th->small, 0);
+    lv_obj_set_style_text_color(sh.clock_lbl, lv_color_hex(th->dim), 0);
+    lv_obj_set_style_text_letter_space(sh.clock_lbl, 2, 0);
+    lv_obj_align(sh.clock_lbl, LV_ALIGN_BOTTOM_MID, 0, -10); /* at the very rim, clear of the bottom icon */
+    lv_obj_set_flag(sh.surv_lbl, LV_OBJ_FLAG_HIDDEN, !TH_IS_CRIMSON);
+    lv_obj_set_style_text_font(sh.surv_lbl, th->small, 0);
+    lv_obj_set_style_text_color(sh.surv_lbl, lv_color_hex(th->accent), 0);
+    lv_obj_set_style_text_letter_space(sh.surv_lbl, 1, 0);
+    lv_obj_align(sh.surv_lbl, LV_ALIGN_TOP_MID, 0, 36); /* under the battery */
+    uint32_t edge = TH_IS_RED ? th->dim : 0x8E8E93; /* the battery's outline and nub */
+    lv_obj_set_style_border_color(sh.bat_body, lv_color_hex(edge), 0);
+    lv_obj_set_style_bg_color(sh.bat_nub, lv_color_hex(edge), 0);
+    bat_show();
+    extras_refresh();
+}
+
 /* ---------- the menu screen ---------- */
 
 static void layout(void)
@@ -479,6 +585,7 @@ void shell_set_menu_style(int style)
     lv_obj_set_style_text_font(sh.name, style == MENU_HONEYCOMB ? th->small : th->body, 0);
     if (list) sh.pos = (float)list_middle(), sh.tick_row = list_middle(); /* no click for setting it */
     layout();
+    extras_apply();
 }
 
 static void chrome_build(void) /* the terminal's header, hints and scroll cells, for what the list shows */
@@ -709,6 +816,7 @@ void shell_time(int64_t unix_s, int tz_min)
     sh.now = unix_s;
     sh.tz = tz_min;
     pip_time(unix_s, tz_min);
+    extras_refresh();
 }
 
 void shell_button_up(int id)
@@ -739,6 +847,16 @@ void shell_create(void)
 
     sh.menu_scr = lv_obj_create(NULL);
     lv_obj_remove_flag(sh.menu_scr, LV_OBJ_FLAG_SCROLLABLE);
+    for (int i = 0; i < RUNE_N; i++) { /* made first, so it lies behind the rows; hidden unless "Амулет" is on */
+        const rune_line_t *r = &rune_lines[i];
+        sh.rune[i] = lv_line_create(sh.menu_scr);
+        lv_line_set_points(sh.rune[i], r->p, r->n);
+        lv_obj_set_pos(sh.rune[i], r->x, r->y);
+        lv_obj_remove_flag(sh.rune[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_line_width(sh.rune[i], 3, 0);
+        lv_obj_set_style_line_rounded(sh.rune[i], true, 0);
+        lv_obj_add_flag(sh.rune[i], LV_OBJ_FLAG_HIDDEN);
+    }
     for (int i = 0; i < ICON_COUNT; i++) {
         sh.sprites[i] = lv_draw_buf_create(ICON, ICON, LV_COLOR_FORMAT_ARGB8888, 0);
         LV_ASSERT_MALLOC(sh.sprites[i]);
@@ -791,12 +909,14 @@ void shell_create(void)
     lv_obj_set_style_bg_opa(sh.marker, LV_OPA_COVER, 0);
     lv_obj_align(sh.marker, LV_ALIGN_LEFT_MID, 62, 0);
     sh.name = lv_label_create(sh.menu_scr);
+    sh.clock_lbl = lv_label_create(sh.menu_scr); /* "Амулет": the time at the very bottom */
+    sh.surv_lbl = lv_label_create(sh.menu_scr);  /* "Багровый": the survival line under the battery */
     sh.bat = lv_obj_create(sh.menu_scr); /* the body with the fill inside, the nub on the right */
     lv_obj_remove_style_all(sh.bat);
     lv_obj_set_size(sh.bat, 38, 16);
     lv_obj_remove_flag(sh.bat, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_align(sh.bat, LV_ALIGN_TOP_MID, 0, 14);
-    lv_obj_t *body = lv_obj_create(sh.bat);
+    lv_obj_t *body = sh.bat_body = lv_obj_create(sh.bat);
     lv_obj_remove_style_all(body);
     lv_obj_set_size(body, 34, 16);
     lv_obj_set_style_radius(body, 4, 0);
@@ -808,7 +928,7 @@ void shell_create(void)
     lv_obj_set_size(sh.bat_fill, 2, 8);
     lv_obj_set_style_radius(sh.bat_fill, 2, 0);
     lv_obj_set_style_bg_opa(sh.bat_fill, LV_OPA_COVER, 0);
-    th_box(sh.bat, 35, 5, 3, 6, 1, 0x8E8E93);
+    sh.bat_nub = th_box(sh.bat, 35, 5, 3, 6, 1, 0x8E8E93);
     bat_show();
     lv_obj_add_flag(sh.menu_scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(sh.menu_scr, menu_input, LV_EVENT_PRESSED, NULL);

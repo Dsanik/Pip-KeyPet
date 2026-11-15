@@ -44,4 +44,5 @@ int64_t shell_local_time(void);        /* seconds, already shifted to the local 
 void shell_battery(int percent, bool charging); /* from the power chip; -1 = unknown */
 int shell_battery_level(bool *charging);        /* -1 = unknown */
 const char *shell_battery_text(void);           /* "82%", "82%+" while charging, "--" */
+const char *shell_survival_text(void);          /* how long it has run since power-up, no resets: "47м 05с", "3ч 12м", "2д 04ч" */
 lv_draw_buf_t *shell_icon(int icon);   /* the carousel's icon sprite, to reuse inside an app */
