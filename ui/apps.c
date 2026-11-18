@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
+
 
 #define SCR 466
 /* what the games wear in "Амулет" and "Багровый" (TH_IS_RED): TH_RED is the deep red of the frames and grids */
@@ -2388,6 +2390,365 @@ static void dc_open(lv_obj_t *scr)
     lv_timer_pause(dc.timer); /* it starts at rest, showing a face */
 }
 
+/* ================= ЗАСТАВКА: a screensaver in black and crimson, three moods, a tap in the middle changes them =================
+   Everything lives in one stage object and one timer (~30 FPS). ss_close() deletes both, and the shell calls it on every way
+   out: swipe down, the back key, and the display going to sleep (shell_imu -> shell_home). The app is not .awake on purpose:
+   the screen is allowed to fall asleep while it plays. */
+
+#define SS_DEEP 0x9E1B1Bu   /* the deep red */
+#define SS_BRIGHT 0xFF2B2Bu /* the bright scarlet */
+#define SS_EMBER 0xD2480Au  /* dark orange sparks */
+#define SS_EMBER2 0x8A2A05u /* and darker still */
+#define SS_HOT 0xFF8A70u    /* the white-hot edge of a flash */
+#define SS_FRAME_MS 33
+#define SS_SPARKS 20
+#define SS_FLARES 6
+#define SS_RUNE_N 9
+#define SS_RUNE_M 8 /* margin round a rune piece: the glow stroke is never clipped by the object's box */
+enum { SS_ASH, SS_ECLIPSE, SS_BRAND, SS_MODES };
+
+static const char *const ss_names[SS_MODES] = {"ПЕПЕЛ", "ЗАТМЕНИЕ", "КЛЕЙМО"};
+
+/* the brand: a rune as nine straight pieces, in px from the screen's centre; they light up in this order */
+typedef struct { int16_t x1, y1, x2, y2; } ss_seg_t;
+static const ss_seg_t ss_rune[SS_RUNE_N] = {
+    {0, -140, 80, -40},   /* the diamond: upper right */
+    {80, -40, 0, 60},     /* lower right */
+    {0, 60, -80, -40},    /* lower left */
+    {-80, -40, 0, -140},  /* upper left */
+    {0, -140, 0, 160},    /* the stem through it */
+    {-80, -40, -112, -112}, /* the horns */
+    {80, -40, 112, -112},
+    {0, 60, -70, 130},    /* the feet */
+    {0, 60, 70, 130},
+};
+static const uint8_t ss_order[SS_RUNE_N] = {4, 0, 3, 5, 6, 1, 2, 7, 8};
+
+static struct {
+    lv_obj_t *root, *stage, *clock, *title;
+    lv_timer_t *timer;
+    int mode, minute;
+    uint32_t last;       /* tick of the previous frame, 0 = none */
+    float t;             /* seconds since the mode began */
+    float title_t;       /* the mode's name fades out over this many seconds */
+    lv_point_t press;
+    bool dark;           /* the display is off: the timer idles */
+    /* ash */
+    struct { lv_obj_t *dot, *halo; float x0, y, vy, ph, fr, amp, size; uint32_t color; } sp[SS_SPARKS];
+    /* eclipse */
+    lv_obj_t *ring[4];
+    struct { lv_obj_t *dot, *halo; float life, ang, size; } fl[SS_FLARES];
+    /* brand */
+    struct {
+        lv_obj_t *glow, *core;
+        lv_point_precise_t pt[2];
+        float lit; /* 1 at the moment it ignites, then dies away */
+    } rn[SS_RUNE_N];
+    int rune_i;
+    float rune_wait;
+} ss;
+
+static float ss_rf(void) { return lv_rand(0, 10000) / 10000.0f; } /* 0..1 */
+
+static lv_obj_t *ss_box(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_size(o, w, h);
+    return o;
+}
+
+static lv_obj_t *ss_disc(lv_obj_t *parent, int d, uint32_t color) /* a filled circle, centred where it is put */
+{
+    lv_obj_t *o = ss_box(parent, 0, 0, d, d);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(o, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    return o;
+}
+
+static lv_obj_t *ss_ring(lv_obj_t *parent, int d, int width, uint32_t color) /* an outline, centred on the screen */
+{
+    lv_obj_t *o = ss_box(parent, (SCR - d) / 2, (SCR - d) / 2, d, d);
+    lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(o, width, 0);
+    lv_obj_set_style_border_color(o, lv_color_hex(color), 0);
+    lv_obj_set_style_border_opa(o, LV_OPA_TRANSP, 0);
+    return o;
+}
+
+static void ss_put(lv_obj_t *o, float cx, float cy) /* centre a (square) object on a point */
+{
+    lv_obj_set_pos(o, (int32_t)(cx - lv_obj_get_width(o) / 2), (int32_t)(cy - lv_obj_get_height(o) / 2));
+}
+
+static lv_opa_t ss_opa(float v) { return (lv_opa_t)(255 * fminf(1, fmaxf(0, v)) + 0.5f); }
+
+/* ---- 1. ПЕПЕЛ: embers rise from the bottom, sway, and die out toward the top ---- */
+
+static void ss_spark_reset(int i, bool anywhere)
+{
+    static const uint32_t pal[4] = {SS_BRIGHT, SS_DEEP, SS_EMBER, SS_EMBER2};
+    float k = ss_rf();
+    ss.sp[i].size = 3 + k * k * 8; /* mostly small ones, a few big */
+    ss.sp[i].x0 = 50 + ss_rf() * (SCR - 100);
+    ss.sp[i].y = anywhere ? ss_rf() * SCR : SCR + ss.sp[i].size * 2;
+    ss.sp[i].vy = 22 + ss_rf() * 48 - ss.sp[i].size * 1.5f; /* the big ones drift slower */
+    if (ss.sp[i].vy < 14) ss.sp[i].vy = 14;
+    ss.sp[i].ph = ss_rf() * 6.2831853f;
+    ss.sp[i].fr = 0.5f + ss_rf() * 1.1f; /* sway, rad/s */
+    ss.sp[i].amp = 6 + ss_rf() * 22;
+    ss.sp[i].color = pal[lv_rand(0, 3)];
+    int d = (int)ss.sp[i].size;
+    lv_obj_set_size(ss.sp[i].dot, d, d);
+    lv_obj_set_size(ss.sp[i].halo, d * 3, d * 3);
+    lv_obj_set_style_bg_color(ss.sp[i].dot, lv_color_hex(ss.sp[i].color), 0);
+    lv_obj_set_style_bg_color(ss.sp[i].halo, lv_color_hex(ss.sp[i].color), 0);
+}
+
+static void ss_ash_build(void)
+{
+    for (int i = 0; i < SS_SPARKS; i++) {
+        ss.sp[i].halo = ss_disc(ss.stage, 9, SS_DEEP);
+        ss.sp[i].dot = ss_disc(ss.stage, 4, SS_BRIGHT);
+        ss_spark_reset(i, true);
+    }
+}
+
+static void ss_ash_step(float dt)
+{
+    for (int i = 0; i < SS_SPARKS; i++) {
+        ss.sp[i].y -= ss.sp[i].vy * dt;
+        ss.sp[i].ph += ss.sp[i].fr * dt;
+        float up = ss.sp[i].y / SCR;                    /* 1 at the bottom, 0 at the top */
+        float life = fminf(1, fmaxf(0, up)) * 1.15f - 0.1f; /* fades toward the top, gone a little before it */
+        float born = fminf(1, (SCR + ss.sp[i].size * 2 - ss.sp[i].y) / 40 + 0.15f); /* and eases in from below */
+        if (life <= 0.01f) { ss_spark_reset(i, false); continue; }
+        float flick = 0.85f + 0.15f * sinf(ss.t * 9 + i * 1.7f);
+        float o = life * born * flick;
+        float x = ss.sp[i].x0 + ss.sp[i].amp * sinf(ss.sp[i].ph) + 0.35f * ss.sp[i].amp * sinf(ss.sp[i].ph * 2.3f + i);
+        ss_put(ss.sp[i].dot, x, ss.sp[i].y);
+        ss_put(ss.sp[i].halo, x, ss.sp[i].y);
+        lv_obj_set_style_bg_opa(ss.sp[i].dot, ss_opa(o), 0);
+        lv_obj_set_style_bg_opa(ss.sp[i].halo, ss_opa(o * 0.22f), 0);
+    }
+}
+
+/* ---- 2. ЗАТМЕНИЕ: a black disc, a pulsing corona round it, now and then a flare on its edge ---- */
+
+#define SS_DISC 220 /* the black disc's diameter */
+
+static void ss_eclipse_build(void)
+{
+    ss.ring[3] = ss_ring(ss.stage, SS_DISC + 56, 14, SS_DEEP);   /* the outer glow */
+    ss.ring[2] = ss_ring(ss.stage, SS_DISC + 32, 10, SS_DEEP);
+    ss.ring[1] = ss_ring(ss.stage, SS_DISC + 14, 6, SS_BRIGHT);
+    ss.ring[0] = ss_ring(ss.stage, SS_DISC + 2, 3, SS_HOT);      /* the bright rim */
+    lv_obj_t *d = ss_disc(ss.stage, SS_DISC, 0x000000);          /* over the rings' inner edge, so the rim is crisp */
+    ss_put(d, SCR / 2.0f, SCR / 2.0f);
+    for (int i = 0; i < SS_FLARES; i++) {
+        ss.fl[i].halo = ss_disc(ss.stage, 10, SS_BRIGHT);
+        ss.fl[i].dot = ss_disc(ss.stage, 6, SS_HOT);
+        ss.fl[i].life = 0;
+        lv_obj_add_flag(ss.fl[i].halo, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ss.fl[i].dot, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void ss_eclipse_step(float dt)
+{
+    float slow = 0.5f + 0.5f * sinf(ss.t * 1.9f), quick = 0.5f + 0.5f * sinf(ss.t * 5.3f + 1.0f);
+    float shiver = 0.5f + 0.5f * sinf(ss.t * 11.0f + 2.0f);
+    lv_obj_set_style_border_opa(ss.ring[0], ss_opa(0.55f + 0.35f * slow + 0.10f * shiver), 0);
+    lv_obj_set_style_border_opa(ss.ring[1], ss_opa(0.45f + 0.45f * slow), 0);
+    lv_obj_set_style_border_opa(ss.ring[2], ss_opa(0.16f + 0.20f * (1 - slow) + 0.06f * quick), 0);
+    lv_obj_set_style_border_opa(ss.ring[3], ss_opa(0.06f + 0.10f * (1 - slow) * quick), 0);
+    for (int i = 0; i < SS_FLARES; i++) {
+        if (ss.fl[i].life <= 0) {
+            if (ss_rf() < dt * 0.35f) { /* rare: each flare wakes about once in three seconds */
+                ss.fl[i].life = 1;
+                ss.fl[i].ang = ss_rf() * 6.2831853f;
+                ss.fl[i].size = 8 + ss_rf() * 10;
+                int d = (int)ss.fl[i].size;
+                lv_obj_set_size(ss.fl[i].dot, d, d);
+                lv_obj_set_size(ss.fl[i].halo, d * 3, d * 3);
+                lv_obj_remove_flag(ss.fl[i].halo, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_remove_flag(ss.fl[i].dot, LV_OBJ_FLAG_HIDDEN);
+            }
+            continue;
+        }
+        ss.fl[i].life -= dt * 1.3f;
+        if (ss.fl[i].life <= 0) {
+            lv_obj_add_flag(ss.fl[i].halo, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(ss.fl[i].dot, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        float l = ss.fl[i].life, r = SS_DISC / 2 + 4 + (1 - l) * 18; /* it flares on the edge and drifts off as it dies */
+        float x = SCR / 2.0f + cosf(ss.fl[i].ang) * r, y = SCR / 2.0f + sinf(ss.fl[i].ang) * r;
+        ss_put(ss.fl[i].dot, x, y);
+        ss_put(ss.fl[i].halo, x, y);
+        lv_obj_set_style_bg_opa(ss.fl[i].dot, ss_opa(l * 1.4f), 0);
+        lv_obj_set_style_bg_opa(ss.fl[i].halo, ss_opa(l * 0.35f), 0);
+    }
+}
+
+/* ---- 3. КЛЕЙМО: the rune's pieces take light one after another, flash, and die away slowly ---- */
+
+static void ss_brand_build(void)
+{
+    for (int i = 0; i < SS_RUNE_N; i++) {
+        const ss_seg_t *s = &ss_rune[i];
+        int x0 = s->x1 < s->x2 ? s->x1 : s->x2, y0 = s->y1 < s->y2 ? s->y1 : s->y2;
+        ss.rn[i].pt[0] = (lv_point_precise_t){s->x1 - x0 + SS_RUNE_M, s->y1 - y0 + SS_RUNE_M};
+        ss.rn[i].pt[1] = (lv_point_precise_t){s->x2 - x0 + SS_RUNE_M, s->y2 - y0 + SS_RUNE_M};
+        for (int k = 0; k < 2; k++) { /* the wide faint stroke first, the sharp one over it */
+            lv_obj_t *l = lv_line_create(ss.stage);
+            lv_obj_remove_flag(l, LV_OBJ_FLAG_CLICKABLE);
+            lv_line_set_points(l, ss.rn[i].pt, 2);
+            lv_obj_set_pos(l, SCR / 2 + x0 - SS_RUNE_M, SCR / 2 + y0 - SS_RUNE_M);
+            lv_obj_set_style_line_width(l, k ? 4 : 11, 0);
+            lv_obj_set_style_line_rounded(l, true, 0);
+            lv_obj_set_style_line_color(l, lv_color_hex(SS_DEEP), 0);
+            lv_obj_set_style_line_opa(l, k ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+            if (k) ss.rn[i].core = l; else ss.rn[i].glow = l;
+        }
+        ss.rn[i].lit = 0;
+    }
+    ss.rune_i = 0, ss.rune_wait = 0.4f;
+}
+
+static void ss_brand_step(float dt)
+{
+    ss.rune_wait -= dt;
+    if (ss.rune_wait <= 0) {
+        ss.rn[ss_order[ss.rune_i]].lit = 1;
+        ss.rune_i++;
+        if (ss.rune_i >= SS_RUNE_N) ss.rune_i = 0, ss.rune_wait = 2.2f; /* a breath, then the brand is struck again */
+        else ss.rune_wait = 0.42f;
+    }
+    for (int i = 0; i < SS_RUNE_N; i++) {
+        float l = ss.rn[i].lit;
+        ss.rn[i].lit = fmaxf(0, l - dt * 0.34f); /* about three seconds to die away */
+        /* flash: the first moments are white-hot, then scarlet, then the deep red smouldering at ~18% */
+        float hot = fmaxf(0, (l - 0.88f) / 0.12f), glow = l * l;
+        lv_color_t base = lv_color_mix(lv_color_hex(SS_BRIGHT), lv_color_hex(SS_DEEP), ss_opa(l)); /* deep red -> scarlet */
+        lv_color_t c = lv_color_mix(lv_color_hex(SS_HOT), base, ss_opa(hot));
+        float rest = 0.22f + 0.78f * l; /* the colour's strength, 0..1 of itself */
+        c = lv_color_mix(c, lv_color_black(), ss_opa(rest));
+        lv_obj_set_style_line_color(ss.rn[i].core, c, 0);
+        lv_obj_set_style_line_color(ss.rn[i].glow, lv_color_hex(SS_BRIGHT), 0);
+        lv_obj_set_style_line_opa(ss.rn[i].glow, ss_opa(glow * 0.5f), 0);
+    }
+}
+
+/* ---- the frame, the clock, the modes ---- */
+
+static void ss_title_show(void)
+{
+    lv_label_set_text(ss.title, ss_names[ss.mode]);
+    lv_obj_align(ss.title, LV_ALIGN_TOP_MID, 0, 46);
+    lv_obj_set_style_text_opa(ss.title, LV_OPA_COVER, 0);
+    ss.title_t = 1.6f;
+}
+
+static void ss_set_mode(int mode)
+{
+    if (ss.stage) lv_obj_delete(ss.stage); /* the old mood goes with every object it made */
+    ss.mode = mode;
+    ss.stage = ss_box(ss.root, 0, 0, SCR, SCR);
+    lv_obj_move_to_index(ss.stage, 0); /* behind the clock and the name */
+    ss.t = 0;
+    if (mode == SS_ASH) ss_ash_build();
+    else if (mode == SS_ECLIPSE) ss_eclipse_build();
+    else ss_brand_build();
+    ss_title_show();
+}
+
+static void ss_clock_refresh(void)
+{
+    struct tm tm = local_now();
+    int hm = tm.tm_hour * 60 + tm.tm_min;
+    if (hm == ss.minute) return;
+    ss.minute = hm;
+    char t[8];
+    if (shell_local_time() < 1500000000LL) snprintf(t, sizeof t, "--:--"); /* the host has not told the time yet */
+    else snprintf(t, sizeof t, "%02d:%02d", tm.tm_hour, tm.tm_min);
+    lv_label_set_text(ss.clock, t);
+}
+
+static void ss_tick(lv_timer_t *timer)
+{
+    if (!pip_display_on()) { /* asleep: no drawing; the shell closes the app on its own, this only keeps the wait cheap */
+        if (!ss.dark) ss.dark = true, ss.last = 0, lv_timer_set_period(timer, 500);
+        return;
+    }
+    if (ss.dark) ss.dark = false, lv_timer_set_period(timer, SS_FRAME_MS);
+    uint32_t now = lv_tick_get();
+    float dt = ss.last ? fminf(0.1f, (uint32_t)(now - ss.last) / 1000.0f) : SS_FRAME_MS / 1000.0f;
+    ss.last = now ? now : 1;
+    ss.t += dt;
+    if (ss.mode == SS_ASH) ss_ash_step(dt);
+    else if (ss.mode == SS_ECLIPSE) ss_eclipse_step(dt);
+    else ss_brand_step(dt);
+    if (ss.title_t > 0) {
+        ss.title_t -= dt;
+        lv_obj_set_style_text_opa(ss.title, ss_opa(ss.title_t / 0.8f), 0); /* holds, then fades in the last 0.8 s */
+    }
+    ss_clock_refresh();
+}
+
+static void ss_input(lv_event_t *e)
+{
+    lv_point_t p;
+    lv_indev_get_point(lv_indev_active(), &p);
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        ss.press = p;
+        return;
+    }
+    /* a tap in the middle of the screen: the next mood (a swipe down to leave is not a tap) */
+    if (abs(p.x - ss.press.x) > 14 || abs(p.y - ss.press.y) > 14) return;
+    if (hypotf(p.x - SCR / 2.0f, p.y - SCR / 2.0f) < 120) ss_set_mode((ss.mode + 1) % SS_MODES);
+}
+
+static bool ss_button(int id)
+{
+    if (id != PIP_BTN_PWR) return false; /* the bottom key goes back; the top one changes the mood */
+    ss_set_mode((ss.mode + 1) % SS_MODES);
+    return true;
+}
+
+static void ss_close(void)
+{
+    if (ss.timer) lv_timer_delete(ss.timer), ss.timer = NULL;
+    if (ss.root) lv_obj_delete(ss.root), ss.root = NULL; /* the stage, the sparks, the rune, the labels: all children */
+    ss.stage = ss.clock = ss.title = NULL;
+}
+
+static void ss_open(lv_obj_t *scr)
+{
+    int mode = ss.mode;
+    memset(&ss, 0, sizeof ss);
+    ss.minute = -1;
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0); /* pure black, whatever the theme */
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    ss.root = ss_box(scr, 0, 0, SCR, SCR);
+    lv_obj_add_flag(ss.root, LV_OBJ_FLAG_CLICKABLE); /* takes the taps; swipes still reach the screen's back gesture */
+    lv_obj_add_event_cb(ss.root, ss_input, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(ss.root, ss_input, LV_EVENT_CLICKED, NULL);
+    ss.clock = th_text(ss.root, th->tiny, 0x000000, "--:--"); /* small and dim: the deep red at a third */
+    lv_obj_set_style_text_color(ss.clock, lv_color_hex(SS_DEEP), 0);
+    lv_obj_set_style_text_opa(ss.clock, LV_OPA_50, 0);
+    lv_obj_set_style_text_letter_space(ss.clock, 2, 0);
+    lv_obj_align(ss.clock, LV_ALIGN_BOTTOM_MID, 0, -12);
+    ss.title = th_text(ss.root, th->small, SS_BRIGHT, "");
+    ss_set_mode(mode); /* it comes back in the mood it was left in */
+    ss_clock_refresh();
+    ss.timer = lv_timer_create(ss_tick, SS_FRAME_MS, NULL);
+}
+
 /* ================= the list: the first one sits in the middle of the honeycomb ================= */
 
 const app_t apps[] = {
@@ -2413,6 +2774,9 @@ const app_t apps[] = {
     {.id = "remote", .name = "Пульт", .icon = ICON_REMOTE, .color = 0x5E5CE6, .open = phone_remote_open, .close = phone_remote_close,
      .button = phone_remote_button,
      .button_up = phone_remote_button_up, .imu = phone_remote_imu, .gyro = phone_remote_gyro, .awake = true},
+    /* the screensaver: a menu app, last of them. No icon of its own yet: it borrows the torch's, in the torch's colour so the
+       shared sprite stays the same in every icon style. Give it ICON_SAVER in doodle.h and change these two when it exists. */
+    {.id = "saver", .name = "ЗАСТАВКА", .icon = ICON_TORCH, .color = 0xFFD600, .open = ss_open, .close = ss_close, .button = ss_button},
     /* the games, listed by "games" and not in the menu */
     {.id = "ball", .name = "Шарик", .icon = ICON_GAME, .color = 0xDB34F2, .open = game_open, .close = game_close, .imu = game_imu,
      .button = game_button, .group = "games"},
